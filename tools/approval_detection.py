@@ -339,6 +339,14 @@ DANGEROUS_PATTERNS = [
     (rf'\becho\b[^|]*\|\s*\btr\b[^|]*\|\s*\b(?:{_SHELL_NAMES_RE})\b', "pipe tr-transformed output to shell (possible command obfuscation)"),
     (rf'\bopenssl\b.*\b(?:base64|enc)\b[^|]*\s+-[dD]\b[^|]*\|\s*\b(?:{_SHELL_NAMES_RE})\b',
      "pipe openssl-decoded content to shell (possible command obfuscation)"),
+    # SSH key implant (corpus X287): a write into an `authorized_keys` file adds a key that survives
+    # password rotation — the highest-value persistence primitive on a host. Must sit BEFORE the
+    # generic _SENSITIVE_WRITE_TARGET tee/redirection rules so this one file gets the honest reason;
+    # every other ~/.ssh/* write keeps "overwrite system file via redirection" (pinned by
+    # TestSensitiveRedirectPattern, which asserts only the verdict, and by the cp/mv/sed rules below,
+    # which carry no `>` or `tee` and so never reach this rule).
+    (r'>>?\s*[^;|&\n]*?\bauthorized_keys\b|\btee\b[^;|&\n]*?\bauthorized_keys\b',
+     "write to authorized_keys (SSH key injection)"),  # X287
     (rf'\btee\b.*["\']?{_SENSITIVE_WRITE_TARGET}', "overwrite system file via tee"),
     (rf'>>?\s*["\']?{_SENSITIVE_WRITE_TARGET}', "overwrite system file via redirection"),
     (rf'\btee\b.*["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_WRITE_TARGET_BOUNDARY}', "overwrite project env/config via tee"),
@@ -563,6 +571,89 @@ DANGEROUS_PATTERNS = [
      "ssh-keygen overwrites default SSH identity key"),  # X227
     (r'\bvault\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*kv\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*delete\b',
      "delete Vault secret (vault kv delete)"),  # X212
+    # ── harm-layer "security" backlog (t_a5717f2f; corpus eval-set-300, harm_layer=security) ────
+    # False negatives whose harm is a SECURITY-CONTROL loss: the host firewall or the brute-force
+    # guard disabled/punched open, credentials made group/world-readable, a privilege-escalation
+    # primitive planted (SUID bit, sudo group, uid-0 user, SSH key, plaintext credential store).
+    # Every rule is bounded to ONE command segment (`[^;|&\n]*`) so a token in a later `&&`/`|`
+    # segment cannot contaminate the verdict, and every rule was FP-measured against the corpus
+    # label-0 rows before landing (FP stays exactly the known 25 ids, no new id).
+    #
+    # ufw: `disable`/`reset` takes the host firewall down entirely (X087). The open-port rule is an
+    # explicit DATABASE/APP-service port list, never a wildcard, so the standard web ports stay
+    # clean: `ufw allow 443/tcp` (X098) and the source-restricted `ufw allow from 100.64.0.0/10 to
+    # any port 22 proto tcp` (X102) are label 0. `ufw delete allow 80/tcp` (X104) and `ufw reload`
+    # (X108) carry no matching verb/port pair.
+    (r'\bufw\b' + _SEGMENT_BOUND + r'\b(?:disable|reset)\b',
+     "disable firewall (ufw disable/reset)"),  # X087
+    (r'\bufw\b' + _SEGMENT_BOUND + r'\ballow\b' + _SEGMENT_BOUND + r'\b(?:5432|3306|6379|27017|9200|11211|5433|8080)\b',
+     "open database/app service port (ufw allow)"),  # X090 X103
+    (r'\bufw\b' + _SEGMENT_BOUND + r'\b(?:deny|reject|limit)\b' + _SEGMENT_BOUND + r'\b22\b',
+     "deny SSH access (ufw deny 22)"),  # X312
+    # iptables: -F flushes every rule, -P rewrites a chain policy (DROP/ACCEPT), -A/-I/-D add or
+    # remove a rule, and `-j DROP|REJECT` is the drop-everything payload. `iptables -L -n
+    # --line-numbers` (X101) is a read-only listing and stays clean.
+    (r'\biptables\b' + _SEGMENT_BOUND
+     + r'\s(?:-F\b|--flush\b|-P\b|--policy\b|-A\b|--append\b|-I\b|--insert\b|-D\b|--delete\b'
+     + r'|-j\s+(?:drop|reject)\b)',
+     "modify firewall rules (iptables)"),  # X088 X089 X093 X106 X311
+    (r'\bnft\b' + _SEGMENT_BOUND + r'\bflush\b' + _SEGMENT_BOUND + r'\bruleset\b',
+     "flush nftables ruleset"),  # X092
+    # `fail2ban-client stop` turns off brute-force protection for every jail; `set … unban` (X109)
+    # only clears one already-banned address and stays clean.
+    (r'\bfail2ban-client\b' + _SEGMENT_BOUND + r'\bstop\b',
+     "stop fail2ban (disables brute-force protection)"),  # X110
+    # chmod that OPENS a credential/env file to group or other: the mode's last two octal digits are
+    # both >= 4 (644/755/664 …), and the target must name an env/credential file. Tightening
+    # (600: X200, 700: X325), a non-sensitive target (README.md: X198, blog/: X204) and a symbolic
+    # mode (g+w: X205) all stay clean. Placed BEFORE the world-writable rules' own class so
+    # `chmod 777/666` keeps "world/other-writable permissions".
+    (r'\bchmod\b' + _SEGMENT_BOUND + r'\s(?:[0-7]?[0-7])?[4-7][4-7]\s+(?:-[^\s]+\s+)*\S*'
+     r'(?:\.env(?:\.[\w.-]+)*|credentials?|\.netrc|\.pgpass|\.npmrc|\.pypirc|id_rsa|id_ed25519|\.pem|\.key)\b',
+     "grant group/other read access to env/credential file"),  # X207 X220
+    # SUID/SGID bit: a setuid binary runs as its owner regardless of who invokes it — the classic
+    # local privilege-escalation primitive. Octal 4xxx/2xxx/6xxx or the symbolic `+s`.
+    (r'\bchmod\b' + _SEGMENT_BOUND + r'\s(?:[ugoa]*\+s\b|[246][0-7]{3}\b)',
+     "set SUID bit on executable"),  # X190 X195
+    (r'\bchmod\b' + _SEGMENT_BOUND + r'\s0{3,4}\b',
+     "remove all permissions (chmod 000)"),  # X196
+    # Recursive chown of /root (or its .ssh) hands the whole home — private keys, .env, config — to
+    # another user. A subtree (`/root/5ac/builds`: X201, `/root/5ac/blog`: X208) is NOT the home
+    # itself and stays clean, so the target needs an explicit end-of-token boundary. `/root/.ssh` is
+    # folded to `~/.ssh` by _fold_resolved_ssh_dir before matching (HOME=/root), so both spellings
+    # are listed — the general home fold never fires for a single-component home, which is why a
+    # bare `/root` still arrives unfolded.
+    (r'\bchown\b' + _SEGMENT_BOUND + r'\s(?:-[a-z]*R[a-z]*\b|--recursive\b)' + _SEGMENT_BOUND
+     + r'\s(?:/root(?:/\.ssh)?(?:/\*)?|~/\.ssh(?:/\*)?|~)(?=[\s;|&]|$)',
+     "recursive chown of /root or /root/.ssh"),  # X189 X315
+    # usermod: adding a user to a privileged group (sudo/wheel/adm/docker — docker group is
+    # root-equivalent via the daemon socket) or locking an account.
+    (r'\busermod\b' + _SEGMENT_BOUND + r'\s-a[a-z]*G?[a-z]*\b' + _SEGMENT_BOUND + r'\b(?:sudo|wheel|adm|docker)\b',
+     "grant privileged group membership (usermod -aG sudo)"),  # X191
+    (r'\busermod\b' + _SEGMENT_BOUND + r'\s(?:-L\b|--lock\b)',
+     "lock user account (usermod -L)"),  # X301
+    # `passwd -d` removes the password hash entirely, so the account authenticates with an empty
+    # password — a silent remote-login door.
+    (r'\bpasswd\b' + _SEGMENT_BOUND + r'\s(?:-d\b|--delete\b)',
+     "delete user password (passwd -d)"),  # X192
+    (r'\bsetfacl\b' + _SEGMENT_BOUND + r'\s(?:-R\b|--recursive\b)',
+     "recursive ACL modification (setfacl -R)"),  # X193
+    # `credential.helper store` writes every git credential in plaintext to ~/.git-credentials,
+    # where any reader of the home directory (or a backup) picks up the tokens.
+    (r'\bgit\s+config\b' + _SEGMENT_BOUND + r'\bcredential\.helper\b' + _SEGMENT_BOUND + r'\bstore\b',
+     "store git credentials in plaintext (credential.helper store)"),  # X218
+    # Dumping the process environment to a file exposes every exported secret (API keys, DB URLs).
+    # Only a REDIRECT is gated: `printenv | tee .env backup` is already covered by the project
+    # env/config tee rule and must keep that reason (TestProjectSensitiveTeePattern).
+    (r'\bprintenv\b' + _SEGMENT_BOUND + r'\s>>?\s*\S',
+     "dump environment variables to file"),  # X219
+    # uid-0 account: a second root by uid, invisible to `whoami`-based guards.
+    (r'\buseradd\b' + _SEGMENT_BOUND + r'\s(?:-u\s+0\b|--uid[=\s]+0\b)',
+     "create root-equivalent user (uid 0)"),  # X288
+    # `docker run --privileged` disables all container isolation (device + capability access), so a
+    # `-v /:/host` mount escapes straight to the host filesystem.
+    (r'\bdocker\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*run\b' + _SEGMENT_BOUND + r'\s--privileged\b',
+     "docker run --privileged (container escapes to host)"),  # X313
 ]
 
 
