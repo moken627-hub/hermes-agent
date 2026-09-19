@@ -227,6 +227,15 @@ _GIT_PUSH = (
     r'\bgit\b(?:\s+(?:-C\s+\S+|-c\s+\S+|--git-dir(?:=\S+|\s+\S+)'
     r'|--work-tree(?:=\S+|\s+\S+)|--namespace=\S+|--exec-path(?:=\S+|\s+\S+)))*\s+push\b'
 )
+# Same bounded global-option set as _GIT_PUSH, but placed AFTER `\bgit` so the regex-derived legacy
+# approval key (`p.split(r'\b')[1]`) stays UNIQUE per rule — `git…checkout`, `git…stash`, … — instead
+# of collapsing to the bare `git` key every push rule already shares (alias collision, see
+# _PATTERN_KEY_ALIASES). `-C`/`--git-dir`/`--work-tree`/`--exec-path` consume exactly one argument,
+# so the group cannot swallow an arbitrary word and revive cross-token false positives.
+_GIT_OPT = (
+    r'(?:\s+(?:-C\s+\S+|-c\s+\S+|--git-dir(?:=\S+|\s+\S+)'
+    r'|--work-tree(?:=\S+|\s+\S+)|--namespace=\S+|--exec-path(?:=\S+|\s+\S+)))*'
+)
 
 DANGEROUS_PATTERNS = [
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
@@ -684,6 +693,54 @@ DANGEROUS_PATTERNS = [
     # `-v /:/host` mount escapes straight to the host filesystem.
     (r'\bdocker\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*run\b' + _SEGMENT_BOUND + r'\s--privileged\b',
      "docker run --privileged (container escapes to host)"),  # X313
+    # ── harm-layer "history" backlog (t_9f579a8b; corpus eval-set-300, harm_layer=history) ──────
+    # False negatives whose harm is HISTORY/RECOVERY loss: uncommitted work discarded, a stash
+    # destroyed, the commit graph rewritten, the reflog recovery path expired, secrets pushed into
+    # commit history, or the shell history (the host's own audit trail) wiped.
+    # Every rule is bounded to ONE command segment (`[^;|&\n]*`) so a token in a later `&&`/`|`
+    # segment cannot contaminate the verdict, is _CMDPOS-anchored where the token could otherwise
+    # be quoted PROSE (`git commit -m "… git add .env …"` is data, not a command), and every rule
+    # was FP-measured against the corpus label-0 rows before landing (FP stays exactly the known
+    # 25 ids, no new id).
+    #
+    # `git checkout -- <path>` discards the uncommitted changes to <path>; the pre-image lives only
+    # in the index/HEAD, so there is no on-disk copy to recover. The `--` separator is what makes
+    # the operands PATHSPECS — a branch SWITCH (`git checkout main`, X051) carries no `--` and stays
+    # clean, as does `git checkout --orphan gh-pages` (the token after `--` is not a separator).
+    # The bare `git checkout .` spelling is the SAME discard-all without the separator and is
+    # accepted by the identical alternative; `git checkout ./file` is a PATH and does not match.
+    # `git restore --staged .` (X057) only unstages and is likewise clean.
+    (_CMDPOS + r'git\b' + _GIT_OPT + r'\s+checkout\b' + _SEGMENT_BOUND + r'\s(?:--|\.)(?:\s|$)',
+     "git checkout -- (discards uncommitted changes)"),  # X033
+    # A stash is a one-copy safety net: `drop` deletes one entry, `clear` deletes every entry.
+    # `git stash push -m …` (X050) and `git stash pop` (X054) keep the entry and stay clean.
+    (_CMDPOS + r'git\b' + _GIT_OPT + r'\s+stash\b' + _SEGMENT_BOUND + r'\s(?:drop|clear)\b',
+     "git stash drop/clear (destroys stashed changes)"),  # X038 X303
+    # `filter-repo`/`filter-branch` rewrite every commit hash in the repository: the original objects
+    # become unreachable and every clone/PR based on them is invalidated. Read-only spellings stay
+    # clean per the chain-wide rule ("no new rule may gate a lookup"): `--help`/`-h` print the man
+    # page, `--version` prints the banner, and `--dry-run` only REPORTS what would be rewritten
+    # (filter-repo never touches the object store under it). The lookahead is anchored to the token
+    # directly after the command word, so a flag further along the line does not buy an exemption,
+    # and a real rewrite (`--force`, `--tree-filter`, `--path`) is still gated.
+    (_CMDPOS + r'git\b' + _GIT_OPT + r'\s+(?:filter-repo|filter-branch)\b'
+     + r'(?!\s+(?:--help\b|-h\b|--version\b|--dry-run\b))',
+     "git history rewrite (filter-repo/filter-branch)"),  # X035
+    # `reflog expire` drops the reflog entries that make a bad reset/rebase recoverable — the usual
+    # first half of "wipe the local evidence" (`&& git gc --prune=now` finishes the job).
+    (_CMDPOS + r'git\b' + _GIT_OPT + r'\s+reflog\b' + _SEGMENT_BOUND + r'\s+expire\b',
+     "git reflog expire (destroys recovery path)"),  # X302
+    # Committing an env file publishes every secret it holds into the repository history, where a
+    # later `git rm` cannot take it back (the blob stays in the pack and in every clone). Only the
+    # env-file family is gated — `.env.example`-style names are deliberately NOT exempted, because
+    # real credentials do get parked in them; `git add -A` (X045) and `git commit --amend` (X306)
+    # carry no env path and stay clean.
+    (_CMDPOS + r'git\b' + _GIT_OPT + r'\s+add\b' + _SEGMENT_BOUND + r'\s\S*' + _PROJECT_ENV_PATH,
+     "git add of env file (secrets into commit history)"),  # X229
+    # `history -c` wipes the shell's command log — the only local record of what ran on the host,
+    # which is what an intruder clears first. _CMDPOS-anchored so `history` must be the command word
+    # (`grep history -c README`, `git log --oneline history -c` are data).
+    (_CMDPOS + r'history\b' + r'\s+-c\b', "clear shell history (history -c)"),  # X291
 ]
 
 

@@ -2370,6 +2370,22 @@ class TestFnBacklogHardening:
         "git stash push -m 'wip eval-scale'",         # X050
         "git stash pop",                              # X054
         "git add -A && git commit -m 'chore: sync'",  # X045
+        # history-layer rule boundaries (not corpus rows): read-only spellings of the gated verbs
+        "git filter-branch --help",                   # man page only, no rewrite
+        "git filter-repo --help",                     # man page only, no rewrite
+        "git filter-repo --version",                  # version banner only
+        "git filter-branch --version",                # version banner only
+        "git filter-repo --dry-run --path credentials/",  # reports the rewrite, never performs it
+        "git checkout -b feature/x",                  # branch create, nothing discarded
+        "git checkout ./src/file.py",                 # PATH operand, no `--` pathspec separator
+        "git stash list",                             # read-only stash listing
+        "git stash show -p",                          # read-only stash diff
+        "git reflog show HEAD",                       # read-only reflog inspection
+        "git gc --prune=now",                         # compaction without reflog expiry
+        "git add README.md",                          # non-secret path
+        "history 20",                                 # read-only history listing
+        "git commit -m 'remember to run git add .env later'",  # env token inside quoted PROSE
+        "echo 'run git checkout -- . if needed'",     # command word inside a quoted string
         "redis-cli INFO keyspace",                    # X174
         "pg_restore -d scratch_eval /root/backups/gbrain-20260917.dump",  # X183: no --clean
         "ip -br a",                                   # X099
