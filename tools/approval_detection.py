@@ -206,6 +206,16 @@ def detect_hardline_command(command: str) -> tuple:
 
 
 # ---- Dangerous command patterns -----------------------------------------------------------
+# `git` accepts global options BEFORE the subcommand (`git -C DIR push`, `git -c k=v push --mirror`,
+# `git --git-dir=… push`). The old `\bgit\s+push\b` anchor let every global-option spelling bypass the
+# push rules — incident t_b4c8aa19's actual landmine command was `git -C /root/5ac push --mirror origin`.
+# The option group is bounded (fixed alternation, `-C` consumes exactly one argument) so it cannot
+# swallow an arbitrary word and revive cross-token FPs.
+_GIT_PUSH = (
+    r'\bgit\b(?:\s+(?:-C\s+\S+|-c\s+\S+|--git-dir(?:=\S+|\s+\S+)'
+    r'|--work-tree(?:=\S+|\s+\S+)|--namespace=\S+|--exec-path(?:=\S+|\s+\S+)))*\s+push\b'
+)
+
 DANGEROUS_PATTERNS = [
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
@@ -412,8 +422,25 @@ DANGEROUS_PATTERNS = [
     # --ha, --har): --hard is the only reset mode starting with "h", and `--help` is special-cased
     # by git before mode resolution.
     (r'\bgit\s+reset\s+--h(?:a(?:r(?:d)?)?)?\b', "git reset --hard (destroys uncommitted changes)"),
-    (r'\bgit\s+push\b.*--forc[a-z]*\b', "git force push (rewrites remote history)"),
-    (r'\bgit\s+push\b.*-f\b', "git force push short flag (rewrites remote history)"),
+    # Mirror push deletes/force-updates EVERY remote ref absent locally (5ac corpus X304, harm
+    # layer "history"). Bounded to one command segment (`[^;|&\n]`) so an unrelated later command's
+    # token can't contaminate, and anchored on the `--mirr` FLAG SPELLING (with git's unambiguous
+    # long-option abbreviations) so a remote/branch NAMED `mirror` (`git push origin mirror-sync`)
+    # stays clean. _GIT_GLOBAL_OPTS closes the `git -C <dir> push …` bypass (incident t_b4c8aa19
+    # ran exactly this form; the pre-existing force rules were bypassable the same way).
+    (_GIT_PUSH + r'[^;|&\n]*?\s--mirr[a-z]*\b', "git mirror push (deletes/overwrites remote refs not present locally)"),
+    # --force-with-lease is the SAFE force variant (refuses stale overwrite; 5ac corpus X056 tier
+    # contextual). It stays gated — never silently allowed — but gets its own honest reason so the
+    # legacy "rewrites remote history" verdict no longer misattributes it. Must precede the
+    # --force rules: detection returns the FIRST pattern match and `--force\b` matches inside
+    # `--force-with-lease` (hyphen is a word boundary).
+    (_GIT_PUSH + r'[^;|&\n]*?--force-with-lease\b', "git push with lease (safe force variant, still overwrites when lease holds)"),
+    # `.*` (DOTALL) used to cross `;`/`&&`/`|`, blocking a harmless `git push --dry-run … | sed
+    # 's/[0-9a-f]\{40\}/…/'` on an unrelated `-f` in a LATER segment. Same-segment bound fixes it;
+    # real force pushes (`git push -f … && echo done`) still match because -f sits in the push
+    # segment itself.
+    (_GIT_PUSH + r'[^;|&\n]*?--forc[a-z]*\b', "git force push (rewrites remote history)"),
+    (_GIT_PUSH + r'[^;|&\n]*?-f\b', "git force push short flag (rewrites remote history)"),
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
     # `-D` = `-d --force`: only the capital short flag is force-delete, so the group opts out of
     # the module-wide re.IGNORECASE and relies on _lower_preserving_flags keeping dash-prefixed
