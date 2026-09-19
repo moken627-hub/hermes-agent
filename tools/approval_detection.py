@@ -414,6 +414,14 @@ DANGEROUS_PATTERNS = [
     (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
     # Self-termination protection: prevent agent from killing its own process
     (r'\b(pkill|killall)\b.*\b(hermes|gateway|cli\.py)\b', "kill hermes/gateway process (self-termination)"),
+    # killall BY NAME is a broad sweep of every process matching the name (X061 `killall node`
+    # takes down the whole gateway fleet). Placed AFTER the SIGKILL/-r and self-termination rules
+    # so their specific descs win; the operand class excludes flags, so informational `killall -l`
+    # / `-V` (no process-name operand) stay clean.
+    (r'\bkillall\s+(?:-[^\s]*\s+)*[^\s-][^\s]*', "kill processes by name (killall)"),  # X061
+    # fuser -k kills every process holding the file/socket (X065 `fuser -k 8787/tcp`); plain
+    # `fuser <file>` only reports PIDs and stays clean — the rule requires the -k/--kill flag.
+    (r'\bfuser\b' + _SEGMENT_BOUND + r'\s(?:-k\b|--kill\b)', "kill processes on file/socket (fuser -k)"),  # X065
     # Self-termination via kill + $(pgrep/pidof): the substitution is opaque to the name-based
     # pattern above, so catch the structural form.
     (r'\bkill\b.*\$\(\s*(pgrep|pidof)\b', "kill process via pgrep/pidof expansion (self-termination)"),
