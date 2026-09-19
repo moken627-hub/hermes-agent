@@ -1266,6 +1266,45 @@ class TestGitDestructiveOps:
         assert fold("git branch -D x\nGIT branch -d y") == "git branch -D x\ngit branch -d y"
         assert fold("GIT PUSH --FORCE origin") == "git push --FORCE origin"
         assert fold("VAR=-D git branch -D x") == "var=-d git branch -D x"
+    def test_force_push_via_leading_plus_refspec_detected(self):
+        """5ac corpus X040 (t_f3ea3b5c): a leading ``+`` in a refspec is force-push
+        semantics (``git push origin +main:main`` == ``--force``). The ``+`` is a
+        refspec PREFIX (right after whitespace), not a flag or a name character."""
+        for cmd in (
+            "git push origin +main:main",
+            "git push origin +main",
+            "git -C /root/5ac push origin +main:main",
+        ):
+            dangerous, _, desc = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+            assert "force" in desc.lower() or "+" in desc, (cmd, desc)
+
+    def test_push_delete_detected(self):
+        """5ac corpus X305 (t_f3ea3b5c): ``git push origin --delete <branch>`` deletes an
+        unmerged remote branch (harm class: remote history) — same tier as --prune."""
+        for cmd in (
+            "git push origin --delete feature/eval-scale-1",
+            "git push origin -d feature/eval-scale-1",
+            "git push origin :feature/eval-scale-1",
+            "git push origin :refs/heads/feature/x",
+        ):
+            dangerous, _, desc = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+            assert "delete" in desc.lower(), (cmd, desc)
+
+    def test_benign_push_refspecs_not_flagged(self):
+        """Non-force refspecs and ``+`` appearing NOT as a refspec prefix must stay clean
+        (git forbids ``+``-prefixed tag names, so the FP risk surface is name-internal ``+``)."""
+        for cmd in (
+            "git push origin main:main",
+            "git push origin HEAD:main",
+            "git push origin main+",
+            "git push origin v2.0+build",
+            "git push origin main && echo +done",
+            "git push origin --all",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, cmd
 
 
 class TestChmodExecuteCombo:

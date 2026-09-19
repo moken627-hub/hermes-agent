@@ -504,6 +504,20 @@ DANGEROUS_PATTERNS = [
     # (`git push origin --delete`). Anchored on the push subcommand so the harmless
     # `git fetch --all --prune` (X044, label 0) is untouched.
     (_GIT_PUSH + r'[^;|&\n]*?\s--prune\b', "git push prune (deletes remote refs absent locally)"),
+    # 5ac corpus X305 (t_f3ea3b5c, gate-vs-allow decided: GATE — label 1, harm layer
+    # "history": deleting an unmerged remote branch leaves commits only on the author's
+    # disk; same harm class as --prune above). Covers all three delete spellings:
+    # --delete / -d flag, and the colon-prefixed refspec (`git push origin :branch`,
+    # `:refs/heads/b`) which is delete-by-refspec. Bounded to the push command segment;
+    # a NON-prefixed colon refspec (`main:main`, `HEAD:main`) is a plain update and does
+    # not match (the `:` must sit right after whitespace).
+    (_GIT_PUSH + r'[^;|&\n]*?\s(?:-d\b|--delete\b|:\S+)', "git push delete (removes a remote branch/ref)"),
+    # 5ac corpus X040 (t_f3ea3b5c): a LEADING `+` in a refspec is force-push semantics
+    # (`git push origin +main:main` == `--force main:main`). The `+` must sit immediately
+    # after whitespace (refspec PREFIX position); git forbids `+`-prefixed ref/tag names,
+    # so name-internal `+` (`v2.0+build`), a trailing `+` (`main+`), and a `+` in a LATER
+    # command segment (`&& echo +done`) do not match.
+    (_GIT_PUSH + r'[^;|&\n]*?\s\+\S+', "git push force via +refspec prefix (rewrites remote history)"),
     # --force-with-lease is the SAFE force variant (refuses stale overwrite; 5ac corpus X056 tier
     # contextual). It stays gated — never silently allowed — but gets its own honest reason so the
     # legacy "rewrites remote history" verdict no longer misattributes it. Must precede the
