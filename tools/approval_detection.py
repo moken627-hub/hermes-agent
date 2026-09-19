@@ -304,6 +304,28 @@ DANGEROUS_PATTERNS = [
     (rf'>\s*{_SYSTEM_CONFIG_PATH}', "overwrite system config"),
     (r'\bsystemctl\s+(-[^\s]+\s+)*(stop|restart|disable|mask)\b', "stop/restart system service"),
     (r'\bkill\s+-9\s+-1\b', "kill all processes"),
+    # `kill -9 1` (or any `kill -<sig> 1`) targets PID 1: killing init/systemd tears down every
+    # service on the host (X070). `kill -HUP $(cat pid)` (X075) has no bare `1` and stays clean.
+    (r'\bkill\s+-\w+\s+1\s*(?:;|&|$|\n)', "kill PID 1 (init)"),  # X070
+    # `ip link set <iface> down` takes a network interface offline — remote access included
+    # (X094). `ip -br a` (X099) and other read-only `ip` invocations don't carry `link … down`.
+    (r'\bip\b' + _SEGMENT_BOUND + r'\blink\b' + _SEGMENT_BOUND + r'\bset\b' + _SEGMENT_BOUND + r'\bdown\b',
+     "bring network interface down"),  # X094
+    # `systemctl isolate <target>` stops every unit not in the target; rescue/emergency targets
+    # drop all running services (X255). stop/restart/disable are gated by the rule above.
+    (r'\bsystemctl\s+(-[^\s]+\s+)*isolate\s+\S*(?:rescue|emergency)\S*',
+     "systemctl isolate/rescue (drops all running services)"),  # X255
+    # `swapoff -a` disables all swap — instant memory pressure/OOM on a busy host (X285).
+    (r'\bswapoff\b', "disable swap (swapoff)"),  # X285
+    # Writing to /proc/sysrq-trigger issues kernel emergency commands (crash, reboot, remount-ro)
+    # (X282). The target path is the signal; redirection/tee both land on it.
+    (r'\bsysrq-trigger\b', "write to sysrq-trigger (kernel emergency command)"),  # X282
+    # `ln -sf` over an /etc file replaces live system config (resolver, sudoers, sshd) with a
+    # symlink — silent service breakage or privilege redirection (X316). -s is required (a hard
+    # link to /etc files is already gated by overwrite rules when targeted); -f is what makes it
+    # silent replacement.
+    (rf'\bln\s+-[a-z]*f[a-z]*s[a-z]*\b|\bln\s+-[a-z]*s[a-z]*f[a-z]*\b' + _SEGMENT_BOUND + _SYSTEM_CONFIG_PATH,
+     "symlink over /etc file (ln -sf)"),  # X316
     (r'\bpkill\s+-9\b', "force kill processes"),
     # killall with SIGKILL (-9 / -KILL / -s KILL / -SIGKILL) and `killall -r <regex>` broad sweeps
     # that can wipe unrelated processes.
