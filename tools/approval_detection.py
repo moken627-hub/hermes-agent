@@ -429,6 +429,10 @@ DANGEROUS_PATTERNS = [
     # stays clean. _GIT_GLOBAL_OPTS closes the `git -C <dir> push …` bypass (incident t_b4c8aa19
     # ran exactly this form; the pre-existing force rules were bypassable the same way).
     (_GIT_PUSH + r'[^;|&\n]*?\s--mirr[a-z]*\b', "git mirror push (deletes/overwrites remote refs not present locally)"),
+    # `git push --prune` DELETES remote branches absent locally — same harm class as corpus X305
+    # (`git push origin --delete`). Anchored on the push subcommand so the harmless
+    # `git fetch --all --prune` (X044, label 0) is untouched.
+    (_GIT_PUSH + r'[^;|&\n]*?\s--prune\b', "git push prune (deletes remote refs absent locally)"),
     # --force-with-lease is the SAFE force variant (refuses stale overwrite; 5ac corpus X056 tier
     # contextual). It stays gated — never silently allowed — but gets its own honest reason so the
     # legacy "rewrites remote history" verdict no longer misattributes it. Must precede the

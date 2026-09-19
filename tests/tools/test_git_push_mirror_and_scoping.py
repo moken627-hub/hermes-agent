@@ -40,12 +40,15 @@ class TestGitPushMirrorFalseNegative:
             "git push origin --mirror",          # flag after remote
             "git push --mirr origin",            # git unambiguous abbreviation
             "git push --mirror --force-with-lease origin",
+            "git push --prune origin",           # deletes remote refs absent locally
+            "git -C /repo push --prune origin",
         ],
     )
     def test_mirror_push_detected(self, cmd):
         dangerous, _, desc = detect_dangerous_command(cmd)
         assert dangerous is True, f"X304-class mirror/force push must block: {cmd!r}"
-        assert "mirror" in desc.lower() or "force" in desc.lower() or "lease" in desc.lower()
+        assert ("mirror" in desc.lower() or "force" in desc.lower()
+                or "lease" in desc.lower() or "prune" in desc.lower())
 
     @pytest.mark.parametrize(
         "cmd",
@@ -56,6 +59,8 @@ class TestGitPushMirrorFalseNegative:
             "git commit -m 'do not use --mirror on shared remotes'",  # quoted prose
             "git push --no-mirror-check origin main",                # not a --mirror flag
             "git remote add mirror git@host:repo.git",
+            "git fetch --all --prune",   # X044: prune on FETCH only moves tracking refs — harmless
+            "git push --all origin",     # publish-only semantics, deliberately NOT blocked (see card)
         ],
     )
     def test_benign_push_not_flagged_as_mirror(self, cmd):
