@@ -491,24 +491,19 @@ def _provider_trailer_label(agent: Any) -> str:
 
     5ac patch: a *named* custom provider (``providers.<name>`` in config.yaml, e.g. ``bai``)
     resolves to the runtime kind ``custom``, so the trailer read ``Provider: custom`` and hid
-    which endpoint actually serves the model. Show that entry's configured ``name`` instead
-    (``B.AI``), falling back to the requested provider id, then to the runtime kind.
+    which endpoint actually serves the model. ``hermes_cli.provider_display`` maps that back to
+    the configured display name (``B.AI``) — display only, routing untouched.
     """
-    provider = str(getattr(agent, "provider", "") or "")
-    if provider != "custom":
-        return provider
-    requested = str(getattr(agent, "requested_provider", "") or "").strip()
-    if not requested or requested.lower() in {"custom", "auto"}:
-        return provider
-    name = ""
     try:
-        from hermes_cli.config import load_config_readonly
-        entry = (load_config_readonly().get("providers") or {}).get(requested)
-        if isinstance(entry, dict):
-            name = str(entry.get("name") or "").strip()
+        from hermes_cli.provider_display import display_provider_label
+        return display_provider_label(
+            getattr(agent, "provider", ""),
+            getattr(agent, "requested_provider", ""),
+            getattr(agent, "base_url", ""),
+        )
     except Exception:
         logger.debug("provider trailer label lookup failed", exc_info=True)
-    return name or requested
+        return str(getattr(agent, "provider", "") or "")
 
 
 def _timestamp_line(agent: Any) -> str:
