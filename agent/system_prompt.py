@@ -486,6 +486,31 @@ def _zone_bits(now: Any, tz: Any) -> List[str]:
     return bits
 
 
+def _provider_trailer_label(agent: Any) -> str:
+    """Provider shown in the session trailer.
+
+    5ac patch: a *named* custom provider (``providers.<name>`` in config.yaml, e.g. ``bai``)
+    resolves to the runtime kind ``custom``, so the trailer read ``Provider: custom`` and hid
+    which endpoint actually serves the model. Show that entry's configured ``name`` instead
+    (``B.AI``), falling back to the requested provider id, then to the runtime kind.
+    """
+    provider = str(getattr(agent, "provider", "") or "")
+    if provider != "custom":
+        return provider
+    requested = str(getattr(agent, "requested_provider", "") or "").strip()
+    if not requested or requested.lower() in {"custom", "auto"}:
+        return provider
+    name = ""
+    try:
+        from hermes_cli.config import load_config_readonly
+        entry = (load_config_readonly().get("providers") or {}).get(requested)
+        if isinstance(entry, dict):
+            name = str(entry.get("name") or "").strip()
+    except Exception:
+        logger.debug("provider trailer label lookup failed", exc_info=True)
+    return name or requested
+
+
 def _timestamp_line(agent: Any) -> str:
     """Date-only so the prompt is byte-stable for the day; zone + offset so
     tools needn't guess EST vs EDT. Long-lived sessions get an "as of" line on
@@ -509,7 +534,7 @@ def _timestamp_line(agent: Any) -> str:
     if getattr(agent, "_bot_chat_timeless_prompt", False):
         timestamp_line = f"Timezone: {', '.join(_bits)}" if _bits else ""
     trailer = (("Session ID", agent.session_id if agent.pass_session_id else None), ("Model", agent.model),
-               ("Provider", agent.provider), ("Platform", agent.platform))
+               ("Provider", _provider_trailer_label(agent)), ("Platform", agent.platform))
     return timestamp_line + "".join(f"\n{label}: {value}" for label, value in trailer if value)
 
 
