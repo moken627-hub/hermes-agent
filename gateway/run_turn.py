@@ -2344,9 +2344,13 @@ class GatewayTurnMixin:
             f"{context_length / 1_000_000:.1f}M" if context_length >= 1_000_000
             else f"{context_length // 1_000}K" if context_length >= 1_000 else str(context_length)
         )
+        from hermes_cli.provider_display import display_provider_label
         lines = [
             t("gateway.session.info_model", model=resolved.model),
-            t("gateway.session.info_provider", provider=resolved.provider or "openrouter"),
+            # 5ac: a named custom provider resolves to the runtime kind "custom" — show its
+            # configured display name (B.AI) so /new and /status name the real endpoint.
+            t("gateway.session.info_provider",
+              provider=display_provider_label(resolved.provider, None, resolved.base_url) or "openrouter"),
             t("gateway.session.info_context", tokens=ctx_display, source=ctx_source),
         ]
         if (resolved.provider or "") == "moa":
