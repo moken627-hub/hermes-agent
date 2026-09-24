@@ -82,6 +82,15 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
+# Circuit breaker for the quota wall: after this many consecutive ``rate_limited``
+# runs the cooldown-probe loop stops — the card is blocked sticky (``gave_up``,
+# operator unblock) instead of re-probing the same exhausted provider forever.
+# A rate-limited requeue deliberately does not count against
+# ``consecutive_failures`` (quota is an external cause, #t_536b696a burned 542
+# runs / 90 cycles in 6 hours that way), so this streak is counted from
+# ``task_runs`` history instead. ``0`` disables the breaker (legacy behavior).
+_RATE_LIMIT_STREAK_LIMIT = 12
+
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
@@ -1522,6 +1531,51 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _resolve_rate_limit_streak_limit() -> int:
+    """``KANBAN_RATE_LIMIT_STREAK_LIMIT`` (0 = breaker disabled) else default."""
+    return _kb._env_int("KANBAN_RATE_LIMIT_STREAK_LIMIT", _RATE_LIMIT_STREAK_LIMIT)
+
+
+def _rate_limit_streak(
+    conn: sqlite3.Connection, task_id: str, *, cap: Optional[int] = None,
+) -> int:
+    """Count the task's trailing run of ``rate_limited`` outcomes.
+
+    Walks closed runs newest-first (including the one ``detect_crashed_workers``
+    just closed). Any other outcome breaks the streak, so only back-to-back
+    quota walls accumulate; a run that proved the task could start (or the
+    board having no runs at all) leaves the streak at 0.
+
+    *cap* bounds the scan for the guard probe (a task pinned to an exhausted
+    provider can hold hundreds of runs; deciding ``>= limit`` needs no more than
+    ``limit + 1`` rows). Callers that REPORT the streak — the ``gave_up`` payload
+    and the operator-facing error — pass no cap so the number they publish is the
+    exact one.
+    """
+    streak = 0
+    # ``id`` (autoincrement), not ``ended_at``: quota walls land within the same
+    # second — ``ended_at`` ties would order runs unstably and let a completed
+    # run cut the streak the wrong way.
+    sql = (
+        "SELECT outcome FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC"
+    )
+    params: list = [task_id]
+    if cap is not None:
+        # One extra row: it is the one that proves the streak is exactly ``cap``
+        # rather than longer.
+        sql += " LIMIT ?"
+        params.append(max(cap + 1, 1))
+    rows = conn.execute(sql, params).fetchall()
+    for row in rows:
+        if (row["outcome"] or "") == "rate_limited":
+            streak += 1
+            continue
+        break
+    return streak
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1533,7 +1587,11 @@ def check_respawn_guard(
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
-    path never increments ``consecutive_failures``), ``"blocker_auth"``
+    path never increments ``consecutive_failures``), ``"rate_limit_streak"``
+    (the cooldown probe hit a back-to-back ``rate_limited`` run streak at or
+    over ``_RATE_LIMIT_STREAK_LIMIT`` — the caller trips the breaker: the card
+    blocks sticky with a ``gave_up`` event instead of re-probing forever),
+    ``"blocker_auth"``
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
@@ -1577,9 +1635,15 @@ def check_respawn_guard(
         ended_at = latest_run["ended_at"]
         if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
             return "rate_limit_cooldown"
-        # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
+        # Cooldown elapsed — this is the quota probe. A streak of back-to-back
+        # ``rate_limited`` runs means every probe bounced off the same wall:
+        # trip the circuit breaker instead of re-probing forever. The guard
+        # reason alone defers nothing — the caller blocks sticky on it.
+        streak_limit = _resolve_rate_limit_streak_limit()
+        if streak_limit > 0 and _rate_limit_streak(conn, task_id, cap=streak_limit) >= streak_limit:
+            return "rate_limit_streak"
+        # Below the streak limit — intentionally retries forever (spaced by
+        # the cooldown) until quota returns or a real run supersedes it.
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.  A plain
@@ -2022,6 +2086,52 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _trip_rate_limit_streak(
+    conn: sqlite3.Connection, task_id: str, result: "DispatchResult",
+) -> bool:
+    """Block the task sticky on the rate-limit streak breaker. Returns True.
+
+    The card recorded ``_RATE_LIMIT_STREAK_LIMIT`` back-to-back ``rate_limited``
+    runs and its latest probe is past the cooldown: every respawn would bounce
+    off the same exhausted provider, so stop the loop. Funneled through
+    ``_record_task_failure`` with ``force_trip=True`` — the card blocks,
+    a ``gave_up`` event fires (creator notify follows the standard blocked
+    flow) and ``recompute_ready`` holds it for an operator. The provider is
+    read from the task row so the operator sees WHICH quota to fix; the run is
+    already closed (the requeue closed it), so only the counter and the block
+    move. Rare races (task deleted mid-tick) fall through to the plain guard
+    path instead of raising.
+    """
+    row = conn.execute(
+        "SELECT model_override, provider_override FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    streak = _rate_limit_streak(conn, task_id)
+    model = row["model_override"]
+    provider = row["provider_override"] or ""
+    provider_label = f"{model}@{provider}" if model and provider else (model or provider or "unknown")
+    if _record_task_failure(
+        conn, task_id,
+        error=(
+            f"rate-limit streak: {streak} consecutive rate_limited runs against "
+            f"{provider_label} — circuit breaker tripped; fix the provider quota, "
+            "then unblock."
+        ),
+        outcome="rate_limited",
+        force_trip=True,
+        release_claim=False,
+        end_run=False,
+        event_payload_extra={
+            "rate_limit_streak": streak,
+            "provider": provider_label,
+        },
+    ):
+        result.auto_blocked.append(task_id)
+    return True
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2072,6 +2182,14 @@ def _dispatch_lane_task(
             return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
+        if guard_reason == "rate_limit_streak" and not dry_run:
+            # Circuit breaker: back-to-back quota walls — block sticky via the
+            # standard failure path (``gave_up`` event + creator notify) instead
+            # of letting the cooldown-probe loop run forever. Recorded as a guard
+            # reason below too, so ``hermes kanban dispatch`` prints
+            # ``Guarded (rate_limit_streak)`` beside the auto-block and
+            # ``hermes kanban tail`` carries the reason.
+            _trip_rate_limit_streak(conn, task_id, result)
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
         # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
