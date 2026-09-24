@@ -565,6 +565,113 @@ def test_rate_limit_streak_reports_exact_count_above_limit(kanban_home, monkeypa
         assert "14 consecutive rate_limited runs" in payload["error"]
 
 
+def test_rate_limit_streak_resets_on_operator_unblock(kanban_home, monkeypatch):
+    """An operator ``unblock_task`` grants a FRESH quota budget: the breaker must
+    not re-trip on the very next tick just because the old ``rate_limited`` runs
+    still sit in ``task_runs`` (t_8686d971 — the block message tells the
+    operator to "fix the provider quota, then unblock", and without the
+    ``unblocked``-event cutoff that remedy was a no-op: the next dispatch tick
+    re-blocked the card immediately).
+
+    The full recovery loop: 12 walls -> trip -> unblock -> guard None ->
+    dispatch does NOT re-block -> a fresh 11 walls stay below the limit -> the
+    12th NEW wall trips again (the breaker itself is intact).
+    """
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "1")
+    prof = kanban_home / "profiles" / "alpha"
+    prof.mkdir(parents=True)
+    (prof / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+    def _fake_spawn(task, workspace):  # noqa: ARG001 — no real worker process
+        return None
+
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(
+            conn, title="quota wall then unblock", assignee="alpha",
+            model_override="glm-5.3-flash", provider_override="nousky",
+        )
+
+        def _quota_wall(i: int) -> None:
+            pid = 75000 + i
+            assert kb.claim_task(conn, tid, claimer=f"{host}:w{i}") is not None
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, consecutive_failures=0 WHERE id=?",
+                (pid, tid),
+            )
+            conn.commit()
+            _kbd._record_worker_exit(
+                pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+            )
+            assert kbd.detect_crashed_workers(conn) == []
+
+        # --- Phase 1: 12 walls trip the breaker and stick the card blocked.
+        for i in range(12):
+            _quota_wall(i)
+        assert _kbd._rate_limit_streak(conn, tid) == 12
+        _t0 = time.time()
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_kb.time, "time", lambda: _t0 + 60)
+            res = kbd.dispatch_once(conn, failure_limit=2)
+        assert tid in res.auto_blocked
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        # --- Phase 2: the operator's unblock must clear the streak. The
+        # ``unblocked`` event lands at t0+60 (stamped under the fake clock); the
+        # 12 walls ended at t0 — strictly BEFORE the cutoff, so they drop out.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_kb.time, "time", lambda: _t0 + 60)
+            assert kb.unblock_task(conn, tid) is True
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_kb.time, "time", lambda: _t0 + 60)
+            # THE core assertion: the guard lets the card through after unblock.
+            assert kbd.check_respawn_guard(conn, tid) is None
+
+        # --- Phase 3: a real dispatch tick must NOT re-block the card; with the
+        # fake spawn it gets claimed as a normal worker launch.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_kb.time, "time", lambda: _t0 + 60)
+            res = kbd.dispatch_once(conn, failure_limit=2, spawn_fn=_fake_spawn)
+        assert tid not in res.auto_blocked
+        assert any(s[0] == tid for s in res.spawned)
+        # Release the claimed task back to ready (the fake worker never ran):
+        # the still-open run row has ``ended_at IS NULL`` so it neither counts
+        # toward the streak nor cuts it.
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        # --- Phase 4: a fresh budget — 11 new walls (all >= cutoff) stay below
+        # the limit, guard keeps allowing the probe. Walls land at t0+60; the
+        # probe check runs a minute later so the cooldown has elapsed.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(_kb.time, "time", lambda: _t0 + 60)
+            for i in range(20, 31):
+                _quota_wall(i)
+            assert _kbd._rate_limit_streak(conn, tid) == 11
+            mp.setattr(_kb.time, "time", lambda: _t0 + 120)
+            assert kbd.check_respawn_guard(conn, tid) is None
+
+            # --- Phase 5: the 12th NEW wall trips the breaker again — the fix
+            # resets the budget on unblock, it does not disarm the breaker.
+            mp.setattr(_kb.time, "time", lambda: _t0 + 120)
+            _quota_wall(31)
+            assert _kbd._rate_limit_streak(conn, tid) == 12
+            mp.setattr(_kb.time, "time", lambda: _t0 + 180)
+            assert kbd.check_respawn_guard(conn, tid) == "rate_limit_streak"
+
+
 def test_rate_limit_streak_breaker_env_zero_disables(kanban_home, monkeypatch):
     """``KANBAN_RATE_LIMIT_STREAK_LIMIT=0`` keeps the legacy forever-retry
     behavior regardless of how long the quota-wall streak grows."""
