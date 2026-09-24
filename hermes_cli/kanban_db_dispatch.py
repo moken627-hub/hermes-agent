@@ -1536,6 +1536,32 @@ def _resolve_rate_limit_streak_limit() -> int:
     return _kb._env_int("KANBAN_RATE_LIMIT_STREAK_LIMIT", _RATE_LIMIT_STREAK_LIMIT)
 
 
+def _streak_reset_cutoff(conn: sqlite3.Connection, task_id: str) -> int:
+    """``created_at`` of the task's newest ``unblocked`` event, 0 if never unblocked.
+
+    An operator unblock is a *fresh start*: ``unblock_task`` resets
+    ``consecutive_failures`` / ``last_failure_error`` for exactly that reason, so
+    the quota streak must not survive it either. Without this cutoff the breaker
+    re-trips on the very next dispatch tick — the 12 ``rate_limited`` runs stay
+    in ``task_runs`` forever — and the "fix the provider quota, then unblock"
+    remedy the block message itself dictates becomes a no-op that leaves the
+    card stuck in a block/unblock/re-block loop (t_8686d971).
+
+    Deliberately keyed ONLY on the ``unblocked`` event, never on the wider
+    ``('status', 'promoted', 'unblocked', 'reclaimed')`` set the ``recent_success``
+    guard uses: those fire from the dispatcher/board itself during normal life
+    (``kanban_db.py`` emits ``status`` on ordinary transitions), so counting them
+    would reset the streak mid-retry and silence the breaker entirely.
+    """
+    row = conn.execute(
+        "SELECT created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'unblocked' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return int(row["created_at"]) if row is not None else 0
+
+
 def _rate_limit_streak(
     conn: sqlite3.Connection, task_id: str, *, cap: Optional[int] = None,
 ) -> int:
@@ -1545,6 +1571,10 @@ def _rate_limit_streak(
     just closed). Any other outcome breaks the streak, so only back-to-back
     quota walls accumulate; a run that proved the task could start (or the
     board having no runs at all) leaves the streak at 0.
+
+    Runs that closed before the newest operator ``unblocked`` event are ignored:
+    the unblock grants a fresh retry budget (see ``_streak_reset_cutoff``), so
+    only ``ended_at >= cutoff`` runs count once a task has ever been unblocked.
 
     *cap* bounds the scan for the guard probe (a task pinned to an exhausted
     provider can hold hundreds of runs; deciding ``>= limit`` needs no more than
@@ -1559,9 +1589,15 @@ def _rate_limit_streak(
     sql = (
         "SELECT outcome FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY id DESC"
     )
     params: list = [task_id]
+    cutoff = _streak_reset_cutoff(conn, task_id)
+    if cutoff > 0:
+        # Operator unblock = fresh start; walls from before it are history.
+        # ``>=`` so walls landing in the same second as the unblock still count.
+        sql += "AND ended_at >= ? "
+        params.append(cutoff)
+    sql += "ORDER BY id DESC"
     if cap is not None:
         # One extra row: it is the one that proves the streak is exactly ``cap``
         # rather than longer.
