@@ -1003,10 +1003,24 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         topic_id = (metadata or {}).get("direct_messages_topic_id") or (metadata or {}).get("telegram_direct_messages_topic_id")
         return str(topic_id) if topic_id is not None else None
 
+    @staticmethod
+    def _safe_reply_to_int(value):
+        """[t_7ddd1e6c] int() only numeric reply anchors. Stale JSON wake identities
+        (session_automation.admit_route_wake) can still linger in delivery-ledger metadata and
+        queued sends across a restart; raw int() on them crashed every retry of the reply
+        ('invalid literal for int()' storm 15-16/10). Non-numeric ⇒ warn once, send unanchored."""
+        if value is None:
+            return None
+        s = str(value)
+        if s.isdigit():
+            return int(s)
+        logger.warning("[Telegram] Ignoring non-numeric reply anchor: %.140s", s)
+        return None
+
     @classmethod
     def _metadata_reply_to_message_id(cls, metadata: Optional[dict[str, Any]]) -> Optional[int]:
         reply_to = (metadata or {}).get("telegram_reply_to_message_id")
-        return int(reply_to) if reply_to is not None else None
+        return cls._safe_reply_to_int(reply_to)  # [t_7ddd1e6c]
 
     @staticmethod
     def _dm_topic_fallback(metadata: Optional[dict[str, Any]]) -> bool:
@@ -1029,7 +1043,9 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
     def _reply_to_message_id_for_send(
         cls, reply_to: Optional[str], metadata: Optional[dict[str, Any]] = None, reply_to_mode: Optional[str] = None) -> Optional[int]:
         if reply_to:
-            return int(reply_to)
+            _anchor = cls._safe_reply_to_int(reply_to)  # [t_7ddd1e6c] fall through on garbage
+            if _anchor is not None:
+                return _anchor
         if cls._dm_topic_fallback(metadata) and reply_to_mode != "off":
             return cls._metadata_reply_to_message_id(metadata)
         return None
@@ -1432,7 +1448,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             should_thread = reply_to_source is not None and self._reply_to_mode != "off"
         else:
             should_thread = self._should_thread_reply(reply_to_source, index)
-        reply_to_id = int(reply_to_source) if should_thread and reply_to_source else None
+        reply_to_id = self._safe_reply_to_int(reply_to_source) if should_thread and reply_to_source else None  # [t_7ddd1e6c]
         return private_dm_topic_send, dm_topic_reply_to_off, reply_to_id
 
     def _compute_single_send_routing(
