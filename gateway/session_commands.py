@@ -5,11 +5,14 @@ Executing those here would double-submit and bypass their retry identity.
 """
 import asyncio
 from contextlib import contextmanager
+import logging
 import os
 from pathlib import Path
 import shlex
 
 from hermes_state_runtime import RuntimeStoreError
+
+logger = logging.getLogger(__name__)
 
 
 # Reviewed gateway handlers only: listing a command is not permission to run it. Each read was
@@ -24,7 +27,7 @@ _CONTROL_COMMANDS = frozenset({'title'})
 # cached agent, the /debug summary upload, /blueprint's job creation. A turn the handler would have
 # pushed onto the adapter FIFO comes back as a ``send`` directive (gateway/session_command_sink.py).
 _HANDLER_CONTROLS = frozenset({'goal', 'subgoal', 'loop', 'heartbeat', 'review', 'refine', 'debug', 'curator',
-                               'login'})
+                               'login', 'autoprune'})
 # Idle-path commands the messaging gateway answers by rewriting the turn (``_hm_cmd_<name>``,
 # gateway/run_inbound.py): the rewritten text is returned as the client's ``send`` directive.
 _PROMPT_COMMANDS = frozenset({'plan', 'learn', 'init', 'moa', 'blueprint', 'egress'})
@@ -123,14 +126,16 @@ def _resolve_alias(name, arg):
 
 
 def _runner_command(name):
-    """``('exec', shell)`` for a ``type: exec`` quick command, ``('plugin', None)`` for a plugin
-    slash command, else None (read in the owning profile's scope)."""
+    """``('exec', shell)`` for a ``type: exec`` quick command, ``('plugin', registered)`` for a plugin
+    slash command, else None (read in the owning profile's scope). The exact registered name wins over
+    Telegram's ``_`` -> ``-`` form, as main's CLI looked it up: ``foo_bar`` is its own command."""
     from gateway.run import _load_gateway_config
     from hermes_cli.plugins import get_plugin_command_handler
     entry = (_load_gateway_config().get('quick_commands') or {}).get(name)
     if isinstance(entry, dict) and entry.get('type') == 'exec':
         return 'exec', str(entry.get('command') or '')
-    return ('plugin', None) if get_plugin_command_handler(name.replace('_', '-')) else None
+    return next((('plugin', registered) for registered in dict.fromkeys((name, name.replace('_', '-')))
+                 if get_plugin_command_handler(registered)), None)
 
 
 async def _run_runner_command(runner, live, name, arg, kind, shell):
@@ -153,10 +158,22 @@ async def _run_runner_command(runner, live, name, arg, kind, shell):
             raise RuntimeStoreError('cwd_unavailable')
         return await runner._hm_run_exec_quick_command(name, shell, cwd=cwd)
     # Plugin-only: the runner's quick commands are the launch profile's under multiplex, and this
-    # session's own were already resolved above in its profile (``_resolve_alias``/``_runner_command``).
+    # session's own were already resolved above in its profile (``_resolve_alias``/``_runner_command``),
+    # so is the registered name (``shell``) the handler is looked up by.
+    from hermes_cli.plugins import get_plugin_command_handler
+    handler = get_plugin_command_handler(shell)
+    if handler is None:
+        raise RuntimeStoreError('unsupported_command')
     event = MessageEvent(text='/' + name + (' ' + arg if arg else ''), source=live.source)
-    _handled, output, _command = await runner._hm_dispatch_plugin_command(event, live.source, name)
-    return output
+    # The session's own entry, so HERMES_SESSION_ID is bound as on its turns: a background job
+    # the handler starts records this session as its parent.
+    entry = await asyncio.to_thread(runner.session_store.lookup_by_session_key, live.route)
+    try:
+        # The argument as typed, like main's CLI: no messaging dash repair.
+        return await runner._hm_run_plugin_handler(handler, event, live.source, entry, args=arg)
+    except Exception as e:  # main's CLI printed it; messaging (run_inbound_hooks) still only logs it
+        logger.warning("Plugin command dispatch failed: %s", e, exc_info=True)
+        return t('cli.plugin.command_error', error=str(e) or type(e).__name__)
 
 
 def _skill_directive(name, arg, route):
@@ -255,7 +272,7 @@ async def execute_command(connection, ref, params, *, dispatch=False):
         return {'type': 'exec', 'output': _text(output)}
     if definition is None:
         def build():
-            with _profile_runtime_scope(home):
+            with _profile_runtime_scope(home), _session_workspace(authority.runner, live.source):
                 return _skill_directive(name, arg, live.route)
         return await asyncio.to_thread(build)
 
