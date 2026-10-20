@@ -155,19 +155,6 @@ def _mark_notify_metadata(metadata: dict | None) -> dict:
     return notify_metadata
 
 
-def _telegram_numeric_reply_anchor(event, value):
-    """[t_7ddd1e6c] Internal automation events built by gateway/session_automation.py
-    ``admit_route_wake`` carry a JSON wake identity '["<producer>", <session key>, <uuid>]' as
-    message_id on purpose; for telegram that string flowed into the adapter's int() coercion and
-    crashed every reply send (v0.22.1 'invalid literal for int()' storm). Telegram message ids are
-    strictly numeric, so a non-numeric anchor on an INTERNAL event is a synthetic identity ⇒ send
-    unanchored. External events keep opaque anchors untouched (slack ts, feishu ids, unit fakes) —
-    the adapter's _safe_reply_to_int still guards every int() there."""
-    if value is None or not getattr(event, "internal", False):
-        return value
-    return value if str(value).isdigit() else None
-
-
 def _reply_anchor_for_event(event) -> str | None:
     """Return reply_to id for platforms that need reply semantics."""
     override = getattr(event, "reply_anchor_override", None)
@@ -187,12 +174,9 @@ def _reply_anchor_for_event(event) -> str | None:
         # message — replying to the topic seed/anchor can render outside the active lane.
         if getattr(source, "chat_type", None) != "dm":
             return None
-        return _telegram_numeric_reply_anchor(  # [t_7ddd1e6c]
-            event, getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None))
+        return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
     if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
         return getattr(event, "reply_to_message_id", None)
-    if platform == "telegram":  # [t_7ddd1e6c] plain DMs reach the same int() coercion
-        return _telegram_numeric_reply_anchor(event, getattr(event, "message_id", None))
     return getattr(event, "message_id", None)
 
 
