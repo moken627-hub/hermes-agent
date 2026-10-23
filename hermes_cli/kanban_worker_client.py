@@ -22,6 +22,14 @@ _TRANSIENT_OWNER_STATES = frozenset({'draining', 'starting'})
 # Past the board lock wait: the owner's session setup and receipt before and after the write.
 ADMISSION_ANSWER_MARGIN_S = 60.0
 
+# [5ac:owner-transport-retry] an owner alive but thrashing under the host's RAM ceiling fails the
+# websocket dial with one of these transport messages (upstream issue #139612 class of burn).
+_TRANSPORT_FAILURE_PREFIXES = ('Gateway connection failed', 'Gateway connection timed out')
+
+
+def _is_transport_failure(exc):  # [5ac:owner-transport-retry] host condition, not the card's
+    return str(exc).startswith(_TRANSPORT_FAILURE_PREFIXES)
+
 
 def admission_answer_budget():
     """Seconds to wait for ``kanban.run``'s answer: the longest the owner's admission write can
@@ -37,9 +45,13 @@ async def run(params, board_db):
     if os.environ.get('HERMES_TUI_GATEWAY_URL'):
         raise GatewayClientError('Kanban requires the assigned local profile owner')
     deadline = time.monotonic() + OWNER_WAIT_S
+    submitted = False  # [5ac:owner-transport-retry] nothing was re-sent once a claim was accepted
     while True:
         try:
             async with connect_gateway() as client:
+                # [5ac:owner-transport-retry] a socket this loop opens is the point of no return:
+                # anything after it may already have submitted the claim.
+                submitted = True
                 # kanban.run subscribes this socket to the card's session, but only receipts matter
                 # here: discard the turn's events, or they fill the client's bounded queue and its
                 # reader stops, with the next receipt behind it.
@@ -50,6 +62,15 @@ async def run(params, board_db):
                     drain.cancel()
         except GatewayUnavailableError as exc:
             if exc.state not in _TRANSIENT_OWNER_STATES or time.monotonic() >= deadline:
+                raise
+            await asyncio.sleep(1)
+        except (GatewayClientError, OSError) as exc:
+            # [5ac:owner-transport-retry] A refused/stalled dial before any submission is the host's
+            # condition (RAM-ceiling thrash, restart race): redial within the same OWNER_WAIT_S budget
+            # instead of spending the card's failure budget. Post-submit failures keep raising so the
+            # owner still reports 'execution unknown; retained by owner' and never resends the work.
+            if submitted or (not isinstance(exc, OSError) and not _is_transport_failure(exc)) \
+                    or time.monotonic() >= deadline:
                 raise
             await asyncio.sleep(1)
 
