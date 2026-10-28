@@ -761,20 +761,6 @@ _ACTION_GATE = _GateSpec(
 )
 
 
-def _kanban_guardian_only() -> bool:
-    """True when this session is a kanban one-shot worker (``HERMES_KANBAN_TASK`` set by the
-    dispatcher, owner directive 16/10/2026: the smart-guardian is the SOLE approver).
-
-    In these sessions the guardian step never falls through to an operator: DENY resolves
-    instantly (``human_present`` is forced false inside :func:`_smart_gate`) and ESCALATE
-    short-circuits to a fail-closed BLOCKED — no approval card pushed to Telegram, no gateway
-    wait. Read live rather than frozen at import: the flag only ever makes the smart lane
-    STRICTER (a worker cannot trade a guardian verdict for auto-approve; the unattended lanes
-    above this gate still resolve from ``approvals.single_query_mode``/``cron_mode``).
-    """
-    return bool(os.environ.get("HERMES_KANBAN_TASK"))
-
-
 def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: str,
                 pattern_keys: list[str], session_key: str, *,
                 human_present: bool) -> tuple[dict | None, bool]:
@@ -821,25 +807,10 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
 
     smart_denied = False
     if smart:
-        kanban = _kanban_guardian_only()
         result, smart_denied = _smart_gate(spec, command, description, pattern_key, pattern_keys,
-                                           session_key,
-                                           human_present=(is_cli or is_gateway or is_ask) and not kanban)
+                                           session_key, human_present=is_cli or is_gateway or is_ask)
         if result is not None:
             return result
-        if kanban:
-            # The guardian ESCALATED (uncertain or failed call) in a worker session. Owner
-            # directive 16/10/2026: nobody is the operator-of-record for one-shot workers —
-            # fail closed INSTANTLY instead of pushing an approval card and waiting out the
-            # gateway timeout. Not counted toward the denial breaker: an unjudgeable command
-            # is not a guardian DENY, and the worker's next command deserves a fresh verdict.
-            return _denied(
-                f"BLOCKED by smart approval: {description}. The guardian returned no usable "
-                "verdict and kanban worker sessions resolve approvals non-interactively — "
-                "silence is not consent, and no operator is prompted. Do NOT retry this "
-                "command; report it in your task output so the owner can adjudicate.",
-                pattern_key=pattern_key, description=description,
-                outcome="blocked", noun=spec.noun, smart_escalated=True)
     pending_body = pending_body() if pending_body else None
     allow_permanent = not smart_denied
 
