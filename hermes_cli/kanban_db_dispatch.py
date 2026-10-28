@@ -88,6 +88,17 @@ _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 # ``task_runs`` history instead. ``0`` disables the breaker (legacy behavior).
 _RATE_LIMIT_STREAK_LIMIT = 12
 
+# [t_dd382f5c:R2-4] the gateway-unavailable ceiling: F2 made every ``gateway_unavailable``
+# release neutral (right — the card never caused it), but neutrality alone means a gateway that
+# is UP BUT BROKEN re-probes every ``infrastructure_cooldown`` tick FOREVER and silently: the
+# per-run breaker never sees a failure, so nothing blocks and nobody is told. This streak mirrors
+# ``rate_limit_streak`` — the SAME cadence (12 probes x 300 s = one hour of continuous outage),
+# but it trips its own breaker: the card blocks sticky with a ``gave_up`` event naming the
+# gateway (the standard blocked flow notifies the creator — that is the alert path). It NEVER
+# touches ``consecutive_failures``: the trips below run with ``preserve_counter=True`` so the
+# neutrality F2 bought is not paid back by the ceiling. ``0`` disables the breaker.
+_GATEWAY_UNAVAILABLE_STREAK_LIMIT = 12
+
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
@@ -151,6 +162,11 @@ class DispatchResult:
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
     a failure — a long quota window must never trip the circuit breaker."""
+    gateway_unavailable: list[str] = field(default_factory=list)
+    """[t_c995ea84:F2] Task ids whose submitter exited ``KANBAN_GATEWAY_UNAVAILABLE_EXIT_CODE``
+    (the gateway never admitted the run) and were released to ``ready`` WITHOUT counting a
+    failure — a gateway outage must never trip the circuit breaker either. Visible in
+    ``hermes kanban runs`` as the ``gateway_unavailable`` outcome."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -163,7 +179,7 @@ class DispatchResult:
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
-    ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
+    ``active_pr=1, recent_success=2, rate_limited=1, gateway_unavailable=1, skipped_locked=1,
     memory_pressure=critical`` — the respawn-guard reasons counted per task
     plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
     CLI daemon and the embedded gateway dispatcher, which otherwise report a
@@ -179,6 +195,8 @@ def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
+        if res.gateway_unavailable:
+            counts["gateway_unavailable"] = counts.get("gateway_unavailable", 0) + len(res.gateway_unavailable)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
@@ -258,6 +276,10 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("clean_exit", 0)
     if code == _kb.KANBAN_RATE_LIMIT_EXIT_CODE:
         return ("rate_limited", code)
+    # [t_c995ea84:F2] the gateway never admitted this run — a host condition the card must not pay
+    # for, booked with its own neutral outcome instead of ``crashed``.
+    if code == _kb.KANBAN_GATEWAY_UNAVAILABLE_EXIT_CODE:
+        return ("gateway_unavailable", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
     return ("nonzero_exit", code)
@@ -955,8 +977,10 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
 
     Walks closed runs newest-first (including the one ``detect_crashed_workers``
     just closed). ``rate_limited`` runs are neutral and skipped (a quota wall
-    says nothing about the task); any other closed run breaks the streak, so
-    the budget counts ONLY protocol violations. Violations are recognized by the
+    says nothing about the task), as are ``gateway_unavailable`` runs
+    [t_c995ea84:F2] (a host outage says nothing about the task either); any
+    other closed run breaks the streak, so the budget counts ONLY protocol
+    violations. Violations are recognized by the
     ``protocol_violation`` run-metadata marker, with the error text as fallback
     for runs recorded before the marker existed.
     """
@@ -969,7 +993,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     ).fetchall()
     for row in rows:
         outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
+        if outcome in ("rate_limited", "gateway_unavailable"):
             continue
         if outcome == "crashed" and (
             _kb._json_dict(row["metadata"]).get("protocol_violation")
@@ -1057,6 +1081,10 @@ class _DeadWorker:
     event_payload: dict
     protocol_violation: bool = False
     rate_limited: bool = False
+    gateway_unavailable: bool = False
+    """[t_c995ea84:F2] ``KANBAN_GATEWAY_UNAVAILABLE_EXIT_CODE``: the gateway never admitted this
+    run (unreachable/draining past the wait) — the host's condition, so the card is released
+    WITHOUT counting a failure, exactly like a quota wall."""
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
@@ -1064,8 +1092,13 @@ class _DeadWorker:
     @property
     def run_outcome(self) -> str:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
-        # doesn't show a phantom crash for a quota wall.
-        return "rate_limited" if self.rate_limited else "crashed"
+        # doesn't show a phantom crash for a quota wall; a gateway outage is
+        # recorded as ``gateway_unavailable`` for the same reason [t_c995ea84:F2].
+        if self.rate_limited:
+            return "rate_limited"
+        if self.gateway_unavailable:
+            return "gateway_unavailable"
+        return "crashed"
 
 
 def _classify_dead_worker(
@@ -1133,6 +1166,20 @@ def _classify_dead_worker_exit(
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
         )
+    if kind == "gateway_unavailable":
+        # [t_c995ea84:F2] The gateway never admitted this run (it was unreachable, or stayed
+        # draining/starting past the submitter's wait). Nothing about the card ran, so the card
+        # is released to its source phase WITHOUT counting a failure — the same booking a quota
+        # wall gets. The event/run keep their own ``gateway_unavailable`` label so the outage
+        # stays visible in ``hermes kanban runs`` instead of hiding among crashes.
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid} exited {code}: gateway unavailable — the run was never admitted, "
+            "released without counting a failure",
+            "gateway_unavailable",
+            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code},
+            gateway_unavailable=True,
+        )
     if kind == "terminal_provider":
         # The worker classified its own provider failure as unhealable (credential
         # revoked, model gone): every further spawn would hit the same wall, so
@@ -1164,6 +1211,9 @@ class _CrashSweep:
 
     crashed: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
+    gateway_unavailable: list[str] = field(default_factory=list)
+    """[t_c995ea84:F2] task ids released because the GATEWAY never admitted their run: neutral,
+    never accounted as a failure, surfaced through ``DispatchResult.gateway_unavailable``."""
     # ``(task_id, pid, claimer, dead_worker)``: accounted after the txn via
     # ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, _DeadWorker]] = field(default_factory=list)
@@ -1243,6 +1293,13 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 )
             if dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+            elif dead.gateway_unavailable:
+                # [t_c995ea84:F2] Neutral, like the quota wall above but for the HOST: kept out of
+                # ``crash_details`` so ``_account_crashes`` -> ``_record_task_failure`` never runs
+                # and ``consecutive_failures`` is untouched, and ``last_failure_error`` is left
+                # alone too — nothing about the CARD failed. The run row and the event still carry
+                # the outcome, so the outage stays visible in ``hermes kanban runs``.
+                sweep.gateway_unavailable.append(row["id"])
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append((row["id"], pid, row["claim_lock"], dead))
@@ -1338,15 +1395,20 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     violation-only retry budget; ``KANBAN_RATE_LIMIT_EXIT_CODE`` is a quota
     wall, released WITHOUT counting a failure and surfaced via the
     ``_last_rate_limited`` attribute (the return stays crashed-only).
+    ``KANBAN_GATEWAY_UNAVAILABLE_EXIT_CODE`` is a gateway outage the run never
+    got admitted through: same neutral release, surfaced via
+    ``_last_gateway_unavailable`` [t_c995ea84:F2].
     """
     sweep = _reclaim_dead_workers(conn, board=board)
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
-    # requeues did NOT count a failure and are NOT crashes.
+    # requeues and gateway-unavailable releases did NOT count a failure and are
+    # NOT crashes.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_gateway_unavailable = sweep.gateway_unavailable  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1390,6 +1452,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    preserve_counter: bool = False,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1408,6 +1471,11 @@ def _record_task_failure(
     with ``infrastructure: true`` but ``consecutive_failures`` is left alone and
     the breaker never trips; the card stays retryable and
     :func:`check_respawn_guard` spaces the retries.
+
+    ``preserve_counter=True`` [t_dd382f5c:R2-4]: leave ``consecutive_failures``
+    exactly as it is but STILL honour ``force_trip`` — the neutral-outcome
+    ceilings (gateway outage streak) block sticky on their OWN streak without
+    retroactively booking the neutral runs as card failures.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -1424,7 +1492,7 @@ def _record_task_failure(
             if release_claim
             else ("review" if row["status"] == "review" else "ready")
         )
-        failures = int(row["consecutive_failures"]) + (0 if infrastructure else 1)
+        failures = int(row["consecutive_failures"]) + (0 if (infrastructure or preserve_counter) else 1)
 
         # Per-task override wins over caller-supplied and default thresholds.
         task_override = _kb._row_get(row, "max_retries")
@@ -1568,6 +1636,12 @@ def _resolve_rate_limit_streak_limit() -> int:
     return _kb._env_int("KANBAN_RATE_LIMIT_STREAK_LIMIT", _RATE_LIMIT_STREAK_LIMIT)
 
 
+def _resolve_gateway_unavailable_streak_limit() -> int:
+    """``KANBAN_GATEWAY_UNAVAILABLE_STREAK_LIMIT`` (0 = breaker disabled) else default
+    [t_dd382f5c:R2-4]."""
+    return _kb._env_int("KANBAN_GATEWAY_UNAVAILABLE_STREAK_LIMIT", _GATEWAY_UNAVAILABLE_STREAK_LIMIT)
+
+
 def _streak_reset_cutoff(conn: sqlite3.Connection, task_id: str) -> int:
     """``created_at`` of the task's newest ``unblocked`` event, 0 if never unblocked.
 
@@ -1597,11 +1671,20 @@ def _streak_reset_cutoff(conn: sqlite3.Connection, task_id: str) -> int:
 def _rate_limit_streak(
     conn: sqlite3.Connection, task_id: str, *, cap: Optional[int] = None,
 ) -> int:
-    """Count the task's trailing run of ``rate_limited`` outcomes.
+    """Count the task's trailing run of ``rate_limited`` outcomes (see
+    :func:`_outcome_streak` — the generic walker)."""
+    return _outcome_streak(conn, task_id, "rate_limited", cap=cap)
+
+
+def _outcome_streak(
+    conn: sqlite3.Connection, task_id: str, outcome: str, *, cap: Optional[int] = None,
+) -> int:
+    """[t_dd382f5c:R2-4] Count the task's trailing run of ``outcome`` (generic form of
+    :func:`_rate_limit_streak`; identical semantics, including the cutoff).
 
     Walks closed runs newest-first (including the one ``detect_crashed_workers``
     just closed). Any other outcome breaks the streak, so only back-to-back
-    quota walls accumulate; a run that proved the task could start (or the
+    ``outcome`` runs accumulate; a run that proved the task could start (or the
     board having no runs at all) leaves the streak at 0.
 
     Runs that closed before the newest operator ``unblocked`` event are ignored:
@@ -1637,7 +1720,7 @@ def _rate_limit_streak(
         params.append(max(cap + 1, 1))
     rows = conn.execute(sql, params).fetchall()
     for row in rows:
-        if (row["outcome"] or "") == "rate_limited":
+        if (row["outcome"] or "") == outcome:
             streak += 1
             continue
         break
@@ -1651,7 +1734,14 @@ def check_respawn_guard(
 
     Called per ready/review row before any claim attempt. Priority order:
     ``"infrastructure_cooldown"`` (latest run is a ``spawn_failed`` the host
-    refused — no restart-safe scope — within the cooldown; never counted),
+    refused — no restart-safe scope — within the cooldown; never counted, and
+    the same spacing for a ``gateway_unavailable`` release [t_c995ea84:F2] —
+    the gateway never admitted that run, which is just as much the host's
+    condition),
+    ``"gateway_unavailable_streak"`` (back-to-back ``gateway_unavailable``
+    runs at or over ``_GATEWAY_UNAVAILABLE_STREAK_LIMIT`` — the caller blocks
+    sticky WITHOUT counting a failure [t_dd382f5c:R2-4]: the neutral outage
+    must not retry forever and silently when the gateway is up but broken),
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
@@ -1695,6 +1785,27 @@ def check_respawn_guard(
             ended_at = _kb._to_epoch(latest_run["ended_at"])
             if ended_at is not None and (now - ended_at) < rl_cooldown:
                 return "infrastructure_cooldown"
+    # [t_c995ea84:F2] A gateway outage is the host's condition too and is never counted, so it
+    # takes the SAME spacing as the other never-counted outcomes: without it every tick would
+    # spawn a fresh submitter straight back into the same dead gateway. It deliberately does NOT
+    # reach the rate-limit streak breaker below — an outage is not a quota wall, and the breaker
+    # would block the card with a provider-quota message that is simply false.
+    # [t_dd382f5c:R2-4] but spacing alone had NO ceiling: a gateway that is UP BUT BROKEN
+    # re-probed every cooldown forever, silently. Past the spacing this now probes the task's
+    # OWN outage streak; at ``_GATEWAY_UNAVAILABLE_STREAK_LIMIT`` back-to-back outage runs the
+    # caller blocks the card sticky with a gateway-honest message (never a quota one) without
+    # spending a single ``consecutive_failures``. Below the ceiling the behaviour is F2's
+    # exactly — fall through to the remaining guards, no new short-circuit.
+    if latest_run is not None and latest_run["outcome"] == "gateway_unavailable":
+        if rl_cooldown > 0:
+            ended_at = _kb._to_epoch(latest_run["ended_at"])
+            if ended_at is not None and (now - ended_at) < rl_cooldown:
+                return "infrastructure_cooldown"
+        gu_limit = _resolve_gateway_unavailable_streak_limit()
+        if gu_limit > 0 and _outcome_streak(
+            conn, task_id, "gateway_unavailable", cap=gu_limit,
+        ) >= gu_limit:
+            return "gateway_unavailable_streak"
     if latest_run is not None and latest_run["outcome"] == "rate_limited":
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, skipping blocker_auth so
@@ -2151,7 +2262,7 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
 
 
 def _trip_rate_limit_streak(
-    conn: sqlite3.Connection, task_id: str, result: "DispatchResult",
+    conn: sqlite3.Connection, task_id: str, result: DispatchResult,
 ) -> bool:
     """Block the task sticky on the rate-limit streak breaker. Returns True.
 
@@ -2191,6 +2302,42 @@ def _trip_rate_limit_streak(
             "rate_limit_streak": streak,
             "provider": provider_label,
         },
+    ):
+        result.auto_blocked.append(task_id)
+    return True
+
+
+def _trip_gateway_unavailable_streak(
+    conn: sqlite3.Connection, task_id: str, result: DispatchResult,
+) -> bool:
+    """Block the task sticky on the gateway-outage ceiling [t_dd382f5c:R2-4]. Returns True.
+
+    The card recorded ``_GATEWAY_UNAVAILABLE_STREAK_LIMIT`` back-to-back
+    ``gateway_unavailable`` runs — the gateway is up but cannot serve the run — so the
+    spaced re-probe has become the silent forever-loop F2's neutrality enabled. Funneled
+    through ``_record_task_failure`` with ``force_trip=True`` AND
+    ``preserve_counter=True``: the outage runs were never the card's fault, so blocking
+    on the streak must not retroactively book them as failures (unlike the quota trip,
+    which sits at the END of an outcome class that is provider-bound but still spends
+    nothing per run — same argument, applied here where it matters more because
+    ``failure_limit: 2`` would otherwise silently gate the whole fleet during one
+    outage). The ``gave_up`` event carries the exact streak; the standard blocked flow
+    notifies the creator — that notification IS the alert path."""
+    streak = _outcome_streak(conn, task_id, "gateway_unavailable")
+    if _record_task_failure(
+        conn, task_id,
+        error=(
+            f"gateway outage streak: {streak} consecutive gateway_unavailable runs — the "
+            "gateway never admitted this run and shows no sign of serving it. This is the "
+            "HOST's condition, not the card's: no failure was counted. Restart/repair the "
+            "gateway, then unblock."
+        ),
+        outcome="gateway_unavailable",
+        force_trip=True,
+        preserve_counter=True,
+        release_claim=False,
+        end_run=False,
+        event_payload_extra={"gateway_unavailable_streak": streak},
     ):
         result.auto_blocked.append(task_id)
     return True
@@ -2254,6 +2401,11 @@ def _dispatch_lane_task(
             # ``Guarded (rate_limit_streak)`` beside the auto-block and
             # ``hermes kanban tail`` carries the reason.
             _trip_rate_limit_streak(conn, task_id, result)
+        elif guard_reason == "gateway_unavailable_streak" and not dry_run:
+            # [t_dd382f5c:R2-4] the outage ceiling: same sticky block + gave_up alert,
+            # but the gateway-honest message and NO failure booked — the card never
+            # caused the streak.
+            _trip_gateway_unavailable_streak(conn, task_id, result)
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
         # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
@@ -2383,6 +2535,9 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
+    # [t_c995ea84:F2] neutral releases: counted on the tick so telemetry sees the outage, never
+    # folded into ``crashed``.
+    result.gateway_unavailable.extend(getattr(detect_crashed_workers, "_last_gateway_unavailable", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 

@@ -7,11 +7,27 @@ must never submit the claim twice, and a non-transient refusal still fails at on
 """
 
 import asyncio
+import sqlite3
 from contextlib import asynccontextmanager
 
 import pytest
 
 from hermes_cli import gateway_client, kanban_worker_client
+
+
+def _empty_board(tmp_path) -> str:
+    """A REAL, readable board with no marker — the shape the dispatcher actually spawns
+    against (it just claimed the task IN this file). [t_dd382f5c:R2-5] the admission gate
+    fails CLOSED on a board it cannot read (absent/corrupt paths no longer prove absence),
+    so a test of the redial path must present a board the gate can genuinely read and find
+    marker-free — 'provable absence' is the only answer that licenses a redial."""
+    path = tmp_path / "kanban.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE IF NOT EXISTS task_events (id INTEGER PRIMARY KEY, task_id TEXT,"
+                 " run_id INT, kind TEXT, payload TEXT, created_at INT)")
+    conn.commit()
+    conn.close()
+    return str(path)
 
 
 def _owner(states, submitted):
@@ -46,7 +62,7 @@ async def test_worker_waits_out_a_draining_owner_and_submits_once(monkeypatch, t
     monkeypatch.setattr(session_kanban, "worker_result", lambda *_: {"exit_code": 0, "last_output": "card closed"})
     monkeypatch.delenv("HERMES_TUI_GATEWAY_URL", raising=False)
 
-    assert await kanban_worker_client.run({"task_id": "t1"}, str(tmp_path / "kanban.db")) == 0
+    assert await kanban_worker_client.run({"task_id": "t1"}, _empty_board(tmp_path)) == 0
     assert submitted == ["kanban.run"]
 
 
@@ -58,7 +74,7 @@ async def test_worker_fails_at_once_when_the_owner_is_not_transiently_down(monke
     monkeypatch.delenv("HERMES_TUI_GATEWAY_URL", raising=False)
 
     with pytest.raises(gateway_client.GatewayClientError):
-        await kanban_worker_client.run({"task_id": "t1"}, str(tmp_path / "kanban.db"))
+        await kanban_worker_client.run({"task_id": "t1"}, _empty_board(tmp_path))
     assert submitted == []
 
 

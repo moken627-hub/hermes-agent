@@ -233,7 +233,7 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "reaped_terminal_workers", "crashed", "stale",
-    "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
+    "timed_out", "auto_blocked", "rate_limited", "gateway_unavailable", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable",
 )
@@ -312,6 +312,19 @@ KANBAN_RATE_LIMIT_EXIT_CODE = 75
 # (404), TLS chain broken — a retry cannot fix it, so the dispatcher parks the card blocked on
 # the FIRST occurrence instead of spending ``failure_limit`` identical spawns. 78 == BSD EX_CONFIG.
 KANBAN_TERMINAL_PROVIDER_EXIT_CODE = 78
+
+# [t_c995ea84:F2] the submitter's three-way verdict, so a gateway outage stops being booked as a
+# card crash. The dispatcher maps ONLY the middle one to the neutral ``gateway_unavailable``
+# outcome; the other two keep today's counted-crash booking (an owner's refusal and a turn whose
+# outcome was lost are the card's business, not the host's).
+# (a) the OWNER refused the admission (its own bounded decision code) — 77 == BSD EX_NOPERM.
+KANBAN_ADMISSION_REFUSED_EXIT_CODE = 77
+# (b) the GATEWAY never admitted this run (unreachable/draining past the wait, socket refused) —
+# 76, the sentinel the owner-refused fix plan picked for "gateway unavailable".
+KANBAN_GATEWAY_UNAVAILABLE_EXIT_CODE = 76
+# (c) admitted, then lost: the receipt never settled and no ``worker_result`` exists to reconcile —
+# 69 == BSD EX_UNAVAILABLE (the run's outcome is unavailable).
+KANBAN_EXECUTION_UNKNOWN_EXIT_CODE = 69
 
 
 def _resolve_crash_grace_seconds() -> int:
@@ -2022,7 +2035,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
+        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'gateway_unavailable'"
         ") ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
     payload = _json_dict(_row_get(row, "payload"))
