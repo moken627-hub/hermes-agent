@@ -262,6 +262,15 @@ _GIT_OPT = (
 # ever an informational listing there, and a lookup is a lookup.
 _LOOKUP_FLAGS = r'(?!\s+(?:--help\b|-h\b|--version\b|--dry-run\b|--list\b))'
 
+# Descriptions that carry an FP gate of their own (t_182f0534) — identified by NAME inside
+# detect_dangerous_command, so the pattern text and the gate can never drift apart silently.
+_RSYNC_DELETE_DESCRIPTION = (
+    "rsync --delete into live data tree or unknown destination "
+    "(deletes destination files missing at source)"
+)
+_CHECKOUT_DISCARD_DESCRIPTION = "git checkout -- (discards uncommitted changes)"
+_MIRROR_PUSH_DESCRIPTION = "git mirror push (deletes/overwrites remote refs not present locally)"
+
 DANGEROUS_PATTERNS = [
     (r'\brm\s+(-[^\s]*\s+)*/', "delete in root path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
@@ -531,7 +540,7 @@ DANGEROUS_PATTERNS = [
     # long-option abbreviations) so a remote/branch NAMED `mirror` (`git push origin mirror-sync`)
     # stays clean. _GIT_PUSH closes the `git -C <dir> push …` bypass (incident t_b4c8aa19
     # ran exactly this form; the pre-existing force rules were bypassable the same way).
-    (_GIT_PUSH + r'[^;|&\n]*?\s--mirr[a-z]*\b', "git mirror push (deletes/overwrites remote refs not present locally)"),
+    (_GIT_PUSH + r'[^;|&\n]*?\s--mirr[a-z]*\b', _MIRROR_PUSH_DESCRIPTION),
     # `git push --prune` DELETES remote branches absent locally — same harm class as corpus X305
     # (`git push origin --delete`). Anchored on the push subcommand so the harmless
     # `git fetch --all --prune` (X044, label 0) is untouched.
@@ -648,13 +657,18 @@ DANGEROUS_PATTERNS = [
      + _SEGMENT_BOUND + r'\b' + _APT_INFRA_PACKAGES,
      "apt remove/purge of security or infrastructure package"),  # X111 X113 X114 X115 X116 X130
     # rsync --delete makes the destination match the source, so files present only at the
-    # destination are deleted: an empty or stale source wipes a backup or a live tree. A destination
-    # that names itself a MIRROR (`builds-mirror/`, X028) is the label-0 boundary — the exemption
-    # requires the `mirror` token to look like a PATH (a `/` earlier in the same token), so a bare
-    # `# mirror` comment cannot disable the rule, a `~/…-mirror/` spelling is exempt like its
-    # absolute twin, and a plain `rsync -av` (X241) never matches.
-    (r'\brsync\b' + _SEGMENT_BOUND + r'\s--delete\b(?![^;|&\n]*\s\S*/\S*mirror)',
-     "rsync --delete over live data tree (deletes files missing at source)"),  # X233 X247 X251
+    # destination are deleted. DIRECTION decides the verdict (t_182f0534): the gate fires only
+    # when the DESTINATION is a live data tree / user home (~, /root, /home, /var/lib, /etc,
+    # /var/log, DB or backup dirs) or cannot be determined — an empty or stale source then wipes
+    # real data (X233 X247 X251). The deploy direction — a build artifact (dist/, build/, out/,
+    # .next/) synced into a static webroot (/var/www, /usr/share/nginx, public_html) — is how the
+    # fleet ships decks and stays clean; so does the X028 destination that names itself a MIRROR
+    # (exemption requires the `mirror` token to look like a PATH, so a bare `# mirror` comment
+    # cannot disable the rule). SRC-vs-DEST parsing lives in _rsync_delete_is_exempt(): a flat
+    # regex cannot tell which operand is the destination, and prose quoting this command inside
+    # a card body must get the same direction verdict. `rsync -av` (X241) never matches at all.
+    (r'\brsync\b' + _SEGMENT_BOUND + r'\s--delete\b',
+     _RSYNC_DELETE_DESCRIPTION),  # X233 X247 X251
     (r'\bcrontab\b' + _SEGMENT_BOUND + r'\s-r\b', "remove crontab (crontab -r)"),  # X261
     # Redirect overwriting a backup: a bare `>` in command position truncates the file with no
     # producer (X232), and `pg_dump > …-latest.dump` overwrites the rollback point (X184). A
@@ -789,14 +803,20 @@ DANGEROUS_PATTERNS = [
     # 25 ids, no new id).
     #
     # `git checkout -- <path>` discards the uncommitted changes to <path>; the pre-image lives only
-    # in the index/HEAD, so there is no on-disk copy to recover. The `--` separator is what makes
-    # the operands PATHSPECS — a branch SWITCH (`git checkout main`, X051) carries no `--` and stays
-    # clean, as does `git checkout --orphan gh-pages` (the token after `--` is not a separator).
-    # The bare `git checkout .` spelling is the SAME discard-all without the separator and is
-    # accepted by the identical alternative; `git checkout ./file` is a PATH and does not match.
-    # `git restore --staged .` (X057) only unstages and is likewise clean.
-    (_CMDPOS + r'git\b' + _GIT_OPT + r'\s+checkout\b' + _SEGMENT_BOUND + r'\s(?:--|\.)(?:\s|$)',
-     "git checkout -- (discards uncommitted changes)"),  # X033
+    # in the index/HEAD, so there is no on-disk copy to recover. The `--`/`.` operand must be the
+    # FIRST operand after `checkout` (option flags may precede it: `git checkout -q -- .`): with a
+    # REF in between (`git checkout origin/main -- path`, t_182f0534) the command RESTORES one file
+    # from a ref — an intentional overwrite of a single path from history, not the discard-all this
+    # rule exists for — so the ref form is no longer matched here. A branch SWITCH
+    # (`git checkout main`, X051) carries no `--` and stays clean, as does `git checkout --orphan
+    # gh-pages` (the token after `--` is not a separator). The bare `git checkout .` spelling is the
+    # SAME discard-all without the separator and is accepted by the identical alternative;
+    # `git checkout ./file` is a PATH and does not match. `git restore --staged .` (X057) only
+    # unstages and is likewise clean. A discard inside a scratch/tmp worktree is downgraded to
+    # clean by _git_checkout_discard_exempt() — a throwaway tree has nothing of value to lose; a
+    # real worktree keeps the gate (t_182f0534).
+    (_CMDPOS + r'git\b' + _GIT_OPT + r'\s+checkout\b' + r'(?:\s+-\S+)*' + r'\s(?:--|\.)(?:\s|$)',
+     _CHECKOUT_DISCARD_DESCRIPTION),  # X033
     # A stash is a one-copy safety net: `drop` deletes one entry, `clear` deletes every entry.
     # `git stash push -m …` (X050) and `git stash pop` (X054) keep the entry and stay clean.
     (_CMDPOS + r'git\b' + _GIT_OPT + r'\s+stash\b' + _SEGMENT_BOUND + r'\s(?:drop|clear)\b',
@@ -1932,6 +1952,371 @@ def _is_shell_token_spliced_gateway_lifecycle(command: str) -> bool:
     return contains_gateway_lifecycle_command(command)
 
 
+# ---- FP gates for three rule families (t_182f0534) -------------------------------------------
+# Fleet config is approvals.mode=smart with cron/unattended resolving to DENY, so a false
+# positive is not "waiting for approval" — it is a card/cron failure. Each gate below is
+# context/direction aware and FAIL-CLOSED: when context cannot be determined the pattern still
+# fires. Gates run only after their own pattern has already matched, so the common path pays
+# nothing for them.
+
+# Prose-gated families (item 3, r2): a SQL/mirror string can be DATA — printed by a read-only
+# tool or stored in a document — not a statement being executed. Two gates decide that:
+#   Gate A  _read_only_text_tool_invocation: EVERY executable is a read-only text tool
+#           (grep/rg/echo/cat/printf/sed -n) or a context-only builtin (cd/export/set/…).
+#   Gate B  _doc_data_arg_mask: mask ONLY the data-argument of a document sink (gh --body/
+#           --title/-b, git commit -m) and re-test. Any other quoted text scans raw, so
+#           pipe-to-shell / ssh remote command / crontab/at / xargs / write-then-run carriers
+#           that EXECUTE the quoted text stay flagged (t_182f0534 r2 — carriers are an open
+#           set, document sinks are a closed one).
+# Never relaxed for a real DB client, a shell -c/eval payload, or an interpreter payload —
+# see _prose_quote_mask_may_apply, which Gate B runs behind.
+_SQL_PROSE_GATED_DESCRIPTIONS = frozenset({
+    "SQL DROP",
+    "SQL TRUNCATE",
+    "SQL DELETE without WHERE",
+    "SQL DROP SCHEMA",
+    "SQL DROP COLUMN",
+    "SQL UPDATE setting values to NULL",
+    "SQL UPDATE without WHERE (whole-table overwrite)",
+    "SQL DELETE (row deletion)",
+})
+_PROSE_GATED_DESCRIPTIONS = _SQL_PROSE_GATED_DESCRIPTIONS | {_MIRROR_PUSH_DESCRIPTION}
+
+# Read-only text tools: they PRINT/STORE text, they never run it. The card's list (grep, rg,
+# echo, cat, printf, sed -n) plus the line filters that pipe beside them in real commands, and
+# `tee` — the doc-writing heredoc owner. Deliberately NOT here: find/xargs (they exec),
+# awk (system()), interpreters, and any tool whose program-bearing options are parsed into their
+# own detection payloads — those payloads are gated on their own text, where the program word is
+# a command, not prose.
+_READ_ONLY_TEXT_TOOL_NAMES = frozenset({
+    "grep", "rg", "egrep", "fgrep", "ag", "ack",
+    "echo", "printf", "cat", "tee",
+    "head", "tail", "sort", "uniq", "wc", "cut", "tr", "nl", "rev", "column",
+    "sed",  # qualified below: `sed -n` without -i only
+})
+# Context-only shell builtins: they set cwd/env/options but never RUN the text they carry, so a
+# `cd X && grep "UPDATE tasks SET" f` pipeline is still a pure read (replay row 3903 = the card's
+# own item-3 example with a `cd` prefix; `export PATH=…; echo 'DROP TABLE t'` likewise). This
+# does NOT open the substitution hole: `export X=$(git push --mirror)` still surfaces `git` as its
+# own command (heredoc/substitution bodies are extracted as commands by _command_exec_pairs), and
+# Gate A only ever excuses the SQL/mirror prose families — `rm`/`psql`/etc. rules are untouched.
+# Deliberately NOT here: source/`.`, eval, exec, bash/sh/zsh (they DO execute files or text).
+_CONTEXT_ONLY_SHELL_BUILTINS = frozenset({
+    "cd", "export", "set", "unset", "readonly", "declare", "local",
+    "alias", "unalias", "shift", "umask", "pwd", "true", "false", ":",
+})
+# Executors whose ARGUMENT is their program: quoting does not make the text data, so the prose
+# mask must not be applied when one of these is running (its `-c`/`-e` spelling is already
+# surfaced as an execution payload; these are the positional-program spellings).
+_QUOTED_ARG_EVALUATORS = frozenset({
+    "awk", "gawk", "mawk", "nawk", "sed", "expect", "make", "lua", "php", "osascript", "tclsh",
+})
+
+# What actually executes a SQL string is a DB client, and it always quotes it
+# (`psql -c '…'` — corpus X160-X179): the SQL family must never be masked away from one.
+_DB_CLIENT_RE = re.compile(r"(?<![\w./-])(?:psql|pgcli|mysql|mariadb|sqlite3)\b", re.IGNORECASE)
+# Quoted text a shell EVALUATES stays raw for the prose-masked scan: `sh -c 'git push --mirror'`
+# and `xargs sh -c '…'` are real runs; `echo 'never run …'` is not. Anchored to a shell word
+# followed by its -c payload (options may sit in between), or to eval taking its argument.
+_CARRIER_EVAL_RE = re.compile(
+    r"(?<![\w./-])(?:bash|sh|zsh|ksh|dash)\b[^\n;&|]*?\s-c\b"
+    r"|(?<![\w./-])eval\s",
+    re.IGNORECASE,
+)
+
+_HEREDOC_RE = re.compile(r"<<-?\s*(?P<q>['\"]?)(?P<delim>[A-Za-z_][A-Za-z_0-9]*)(?P=q)")
+_RSYNC_SEG_RE = re.compile(r"\brsync\b[^;|&\n]*", re.IGNORECASE)
+_RSYNC_DELETE_OPT_RE = re.compile(r"(?:^|\s)--delete\b")
+# X028 boundary: a destination token that looks like a PATH and names itself a mirror.
+_MIRROR_DEST_RE = re.compile(r"\s\S*/\S*mirror")
+_LIVE_DEST_PREFIXES = ("/root", "/home", "/var/lib", "/etc", "/var/log")
+_WEBROOT_DEST_PREFIXES = ("/var/www", "/usr/share/nginx")
+# Throwaway trees: a `git checkout -- .` inside one loses nothing worth gating on. NB#2 (r2):
+# `.worktrees`/`worktrees` alone is NOT scratch — `/root/5ac/.worktrees/<branch>` is a real
+# persistent branch worktree (replay row 2548: `git -C .worktrees/chat-reply-log checkout -- .`),
+# so only the task-worktree spelling exempts: `.worktrees/t_<id>` (kanban project worktree) or
+# `<…>/worktrees/t_<id>`. A real branch worktree keeps the gate.
+_SCRATCH_PATH_MARKERS = ("/cache/scratch", "/scratch", "/tmp/", "kanban/workspaces",
+                         ".worktrees/t_", "/worktrees/t_")
+
+_CHECKOUT_CMD_RE = re.compile(
+    _CMDPOS + r"git\b(?P<opts>" + _GIT_OPT + r")\s+checkout\b", re.IGNORECASE | re.DOTALL
+)
+_CD_RE = re.compile(r"(?:^|[;&|(\n])\s*cd\s+(?P<path>\S+)")
+_C_OPT_RE = re.compile(r"(?:^|\s)-C\s+(?P<path>\S+)")
+
+
+def _mask_heredoc_bodies(command: str) -> str:
+    """Blank every heredoc body (same length, newlines preserved) for command-word extraction.
+
+    A heredoc body is DATA to its owner (`cat <<EOF … EOF` prints or stores it), so its prose
+    must not look like executables to the read-only gate. Whether the owner EXECUTES the body is
+    decided by the owner's own name (`bash <<EOF` still extracts as bash). A heredoc whose
+    delimiter cannot be parsed is left untouched — fail-closed: the body then gates the command
+    off instead of being silently treated as data.
+    """
+    if "<<" not in command:
+        return command
+    out = list(command)
+    masked_upto = -1
+    for kind, i, _j, quote in _scan_shell(command, subst="uq"):
+        if kind != "char" or quote is not None or not command.startswith("<<", i):
+            continue
+        if i < masked_upto:
+            continue
+        m = _HEREDOC_RE.match(command, i)
+        if not m:
+            continue
+        nl = command.find("\n", m.end())
+        body_start = len(command) if nl < 0 else nl + 1
+        body_end = len(command)
+        pos = body_start
+        while pos < len(command):
+            line_end = command.find("\n", pos)
+            if line_end < 0:
+                line_end = len(command)
+            if command[pos:line_end].strip() == m.group("delim"):
+                body_end = line_end  # keep the delimiter line's newline and everything after
+                break
+            pos = line_end + 1
+        for k in range(body_start, body_end):
+            out[k] = "\n" if command[k] == "\n" else " "
+        masked_upto = body_end
+    return "".join(out)
+
+
+def _command_exec_pairs(command: str) -> list[tuple[str, str]] | None:
+    """(executable basename, segment) per command in *command*, or None when a command word
+    cannot be identified (callers treat None as fail-closed)."""
+    masked = _mask_heredoc_bodies(command)
+    pairs: list[tuple[str, str]] = []
+    for pos in _iter_shell_command_starts(masked):
+        segment = _shell_command_segment(masked, pos)
+        if not segment.strip():
+            continue
+        words = list(_iter_shell_command_word_spans(segment))
+        if not words:
+            return None
+        name = os.path.basename(_deobfuscate_shell_word_for_detection(words[-1][2])).lower()
+        pairs.append((name, segment))
+    return pairs
+
+
+def _sed_is_print_only(segment: str) -> bool:
+    """`sed -n` prints (the card's read-only list); `-i` (in-place edit) never qualifies."""
+    return (
+        bool(re.search(r"(?:^|\s)-n(?:\s|$)", segment))
+        and not re.search(r"(?:^|\s)-(?!-)[\w.]*i[\w.]*(?:\s|$)", segment)
+    )
+
+
+def _read_only_text_tool_invocation(command: str) -> bool:
+    """True when every command in *command* is a read-only text tool (grep/rg/echo/cat/printf/
+    sed -n/…) or a context-only builtin (cd/export/set/…), with heredoc bodies of doc-writing
+    tools excluded from the word scan. Such a command only PRINTS or STORES text — the SQL/mirror
+    families have nothing to match."""
+    pairs = _command_exec_pairs(command)
+    if not pairs:
+        return False
+    return all(
+        (name in _READ_ONLY_TEXT_TOOL_NAMES and (name != "sed" or _sed_is_print_only(segment)))
+        or name in _CONTEXT_ONLY_SHELL_BUILTINS
+        for name, segment in pairs
+    )
+
+
+def _prose_quote_mask_may_apply(description: str, command: str) -> bool:
+    """May the SQL/mirror family be matched against QUOTE-MASKED text at all? False (= scan raw,
+    i.e. flag) whenever any part of the command could EXECUTE the quoted text: a shell -c/eval
+    carrier, an interpreter/program-bearing execution payload, a DB client (SQL), or an executor
+    whose argument is its program (awk '…', sed '…'). Passing this gate only permits masking —
+    WHAT gets masked is decided by _doc_data_arg_mask (t_182f0534 r2): a document sink's
+    data-argument, nothing else."""
+    if _CARRIER_EVAL_RE.search(_mask_quoted_prose(command)):
+        return False
+    if list(_execution_flag_findings(_normalize_command_for_detection(command))):
+        return False
+    if description in _SQL_PROSE_GATED_DESCRIPTIONS and _DB_CLIENT_RE.search(command):
+        return False
+    pairs = _command_exec_pairs(command)
+    if pairs is None:
+        return False
+    return not any(name in _QUOTED_ARG_EVALUATORS for name, _segment in pairs)
+
+
+# Gate B, narrowed (t_182f0534 r2): the ONLY quoted text the SQL/mirror families may be matched
+# with quotes masked is the data-argument of a document-writing construct — a gh body/title or a
+# git commit message. Carriers that EXECUTE quoted text are unbounded (`echo … | sh`, ssh remote
+# command, `| crontab -`, `| at`, write-then-run, the next pipe-to-shell spelling in three
+# months), so whitelisting DOCUMENT sinks closes the class once instead of chasing carriers.
+# Gate A above still handles grep/echo/cat/sed -n prose wholesale; _prose_quote_mask_may_apply
+# still refuses DB clients / sh -c / eval / interpreters before this runs. Same-length blanking
+# keeps pattern indices aligned; a span that cannot be parsed is simply not masked (fail-closed).
+_DOC_DATA_ARG_RES = (
+    # gh … --body/-b/--title <quoted>  (PR/issue bodies and titles are documents)
+    re.compile(
+        r"(?<![\w./-])gh\b[^\n;&|]*?(?:--body|--title|(?<![\w-])-b(?![\w-]))\s+"
+        r"(?P<q>['\"])(?P<body>(?:\\.|(?!(?P=q)).)*)(?P=q)",
+        re.DOTALL,
+    ),
+    # git … commit … --message/-m <quoted>  (the commit message is a document)
+    re.compile(
+        r"(?<![\w./-])git\b[^\n;&|]*?\bcommit\b[^\n;&|]*?"
+        r"(?:--message|(?<![\w-])-m(?![\w-]))\s+"
+        r"(?P<q>['\"])(?P<body>(?:\\.|(?!(?P=q)).)*)(?P=q)",
+        re.DOTALL,
+    ),
+)
+
+
+def _doc_data_arg_mask(command: str) -> str:
+    """Blank (same length, newlines preserved) the doc-tool data-argument spans of *command*.
+
+    Used ONLY for the prose-gated SQL/mirror scan. Anything that is not a gh body/title or a git
+    commit message stays raw — notably pipe-to-shell consumers, ssh remote-command arguments,
+    crontab/at/xargs, sh -c/eval payloads and DB-client statements, which this deliberately does
+    not know about and therefore never excuses.
+    """
+    if '"' not in command and "'" not in command:
+        return command
+    out = list(command)
+    for rx in _DOC_DATA_ARG_RES:
+        for m in rx.finditer(command):
+            for k in range(m.start("body"), m.end("body")):
+                if out[k] != "\n":
+                    out[k] = " "
+    return "".join(out)
+
+
+def _looks_like_path_token(token: str) -> bool:
+    t = token.strip("'\"")
+    if not t or t[0] == "-" or ">" in t or "<" in t:
+        return False
+    return t[0] in "/~$." or "/" in t
+
+
+def _is_static_webroot(dest: str) -> bool:
+    return (
+        any(dest == p or dest.startswith(p + "/") for p in _WEBROOT_DEST_PREFIXES)
+        or "public_html" in dest
+    )
+
+
+def _is_live_data_dest(dest: str) -> bool:
+    if dest.startswith("~"):
+        return True  # user home
+    return (
+        any(dest == p or dest.startswith(p + "/") for p in _LIVE_DEST_PREFIXES)
+        or "/backup" in dest
+    )
+
+
+_BUILD_ARTIFACT_COMPONENTS = frozenset({"dist", "build", "builds", "out", ".next"})
+
+
+def _is_build_artifact_path(path: str) -> bool:
+    """True when *path* is a build-artifact tree (dist/, build/, out/, .next/) by component —
+    the source side of the sanctioned deploy direction (card item 1)."""
+    return any(c in _BUILD_ARTIFACT_COMPONENTS for c in path.strip("'\"").lower().split("/"))
+
+
+def _rsync_delete_is_exempt(command: str) -> bool:
+    """Direction gate for `rsync --delete` (t_182f0534; r2 = NB#1 fail-closed rewrite).
+
+    Exempt only when EVERY `rsync … --delete` segment is PROVABLY safe: a destination that names
+    itself a mirror (X028), or the deploy direction — a build-artifact source (dist/build/out/
+    .next) into a static webroot. Everything else keeps the gate: live data tree / user home /
+    backup dir; a destination that is a shell variable, home-relative, plain-relative or
+    `..`-traversed (`..` is resolved first, so `/var/www/../data/` classifies as `/data`, never
+    as a webroot — NB#1); an absolute destination that is not a static webroot (fail-closed:
+    only the spec's deploy direction exempts); no parseable destination; or a lone path operand
+    that does not name a build artifact (one operand cannot be a running invocation —
+    `rsync -a --delete dist/tuvi-bao-gia/ into it.` in a card body is prose about a deploy and
+    stays clean, anything else has no determinable destination). A stale or empty source would
+    wipe real data, and prose quoting this command gets the same verdict because the scan runs
+    over the raw command text, quotes included.
+    """
+    saw = False
+    for m in _RSYNC_SEG_RE.finditer(command):
+        segment = m.group(0)
+        delete = _RSYNC_DELETE_OPT_RE.search(segment)
+        if not delete:
+            continue
+        saw = True
+        tail = segment[delete.end():]
+        # Operands = path-like tokens CONTIGUOUS with the option run right after --delete; the
+        # first free word ends the invocation. Card-body prose keeps talking on the same line
+        # (`…dist/ into it. …`, `…/var/www/…/. 3. VERIFY … /etc/caddy/Caddyfile …`) and must
+        # never feed the destination parse; option-style tokens (`--exclude …`, a prose `->`)
+        # may interleave without ending it. rsync itself never puts a bare word between its
+        # source and destination, so a free word after an operand means we are in prose.
+        operands = []
+        for tok in tail.split():
+            t = tok.strip("'\"")
+            if _looks_like_path_token(t):
+                operands.append(t)
+            elif t.startswith("-"):
+                continue  # option (or prose arrow): does not terminate the operand run
+            elif operands:
+                break  # first free word after an operand = end of the invocation / prose resumes
+            # free word before any operand (option value like `--exclude foo`): not a break
+        if len(operands) == 1:
+            if _is_build_artifact_path(operands[0]):
+                continue  # lone build-artifact operand = source-only prose (replay row 1107)
+            return False  # lone operand, destination not determinable
+        if not operands:
+            return False  # destination cannot be determined
+        src = operands[0].lower()
+        dest = operands[-1].lower()
+        if dest.startswith("$") or dest.startswith("~") or not dest.startswith("/"):
+            return False  # shell variable / home / relative: destination unknown or live
+        dest = os.path.normpath(dest)  # collapse `..`/`.` before classifying (NB#1)
+        if _MIRROR_DEST_RE.search(" " + dest):
+            continue  # X028: the DESTINATION operand itself names a mirror. R3 (reviewer gate):
+            # match the parsed+normalized dest token, NOT the tail — the tail scan let a
+            # mirror-named SOURCE (`./mirror-out/ -> /root/5ac/data/`) buy exemption when the
+            # destination was live data. Still checked AFTER the relative/variable gate above
+            # (a relative dest is never provably safe: `./mirror-out/` and `dist/ ->
+            # ./mirror-out/` stay flagged) and BEFORE _is_live_data_dest (the X028 absolute
+            # live-path dest that names itself a mirror keeps its corpus-pinned exemption).
+        if _is_live_data_dest(dest):
+            return False  # stale source would wipe live data / home / backups
+        if _is_static_webroot(dest) and _is_build_artifact_path(src):
+            continue  # build artifact -> static webroot: the deploy direction (spec)
+        return False  # not provably the deploy direction: fail-closed (NB#1)
+    return saw
+
+
+def _is_scratch_path(path: str) -> bool:
+    p = path.strip("'\"").rstrip("/")
+    if not p:
+        return False
+    if p == "/tmp":
+        return True
+    return any(marker in p for marker in _SCRATCH_PATH_MARKERS)
+
+
+def _git_checkout_discard_exempt(command: str) -> bool:
+    """Downgrade `git checkout -- .` inside a scratch/tmp worktree to clean (t_182f0534).
+
+    The governing directory is the `git -C <dir>` operand when present, else the last `cd`
+    before the checkout; both are read from the quote-masked text (same length, so indices stay
+    aligned) so `echo "cd /tmp"` prose cannot grant the exemption. A real worktree — anything
+    that is not provably scratch/tmp — keeps the gate.
+    """
+    masked = _mask_quoted_prose(command)
+    m = _CHECKOUT_CMD_RE.search(masked)
+    if not m:
+        return False
+    c_opt = _C_OPT_RE.search(m.group("opts") or "")
+    if c_opt:
+        return _is_scratch_path(c_opt.group("path"))
+    cds = list(_CD_RE.finditer(masked[: m.start()]))
+    if not cds:
+        return False
+    return _is_scratch_path(cds[-1].group("path"))
+
+
 def detect_dangerous_command(command: str) -> tuple:
     """Check dangerous patterns -> (is_dangerous, pattern_key, description)."""
     if _command_parser_limit_exceeded(command):
@@ -1939,8 +2324,12 @@ def detect_dangerous_command(command: str) -> tuple:
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
     for command_variant in _command_detection_variants(command):
+        if not command_variant:
+            continue
         command_lower = _lower_preserving_flags(command_variant)
         masked_lower: str | None = None
+        prose_masked_lower: str | None = None
+        prose_tool_ok: bool | None = None
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
             if description in _QUOTE_MASKED_DANGEROUS_DESCRIPTIONS:
                 if masked_lower is None:
@@ -1949,8 +2338,35 @@ def detect_dangerous_command(command: str) -> tuple:
                     )
                 if pattern_re.search(masked_lower):
                     return (True, description, description)
-            elif pattern_re.search(command_lower):
+                continue
+            if not pattern_re.search(command_lower):
+                continue
+            if description in _PROSE_GATED_DESCRIPTIONS:
+                # t_182f0534 r2: Gate A (read-only text tool / context builtin) = data; Gate B
+                # masks ONLY doc-tool data-args (gh --body/-m…); everything else scans raw, so
+                # pipe-to-shell / ssh / crontab / at / write-then-run carriers stay flagged.
+                if prose_tool_ok is None:
+                    prose_tool_ok = _read_only_text_tool_invocation(command_variant)
+                if prose_tool_ok:
+                    continue
+                if _prose_quote_mask_may_apply(description, command_variant):
+                    if prose_masked_lower is None:
+                        prose_masked_lower = _lower_preserving_flags(
+                            _doc_data_arg_mask(command_variant)
+                        )
+                    if pattern_re.search(prose_masked_lower):
+                        return (True, description, description)
+                    continue  # matched only inside a doc-tool data argument (pure data)
                 return (True, description, description)
+            if description == _RSYNC_DELETE_DESCRIPTION:
+                if _rsync_delete_is_exempt(command_variant):
+                    continue
+                return (True, description, description)
+            if description == _CHECKOUT_DISCARD_DESCRIPTION:
+                if _git_checkout_discard_exempt(command_variant):
+                    continue
+                return (True, description, description)
+            return (True, description, description)
     normalized = _normalize_command_for_detection(command)
     for description, _ in _execution_flag_findings(normalized):
         return (True, description, description)

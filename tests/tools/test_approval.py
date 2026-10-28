@@ -2191,11 +2191,11 @@ class TestFnBacklogHardening:
         ("apt remove --purge -y docker.io", "apt remove/purge of security or infrastructure package"),  # X115
         ("apt purge -y ufw", "apt remove/purge of security or infrastructure package"),  # X130
         ("rsync -a --delete /root/empty/ /root/5ac/backups/",
-         "rsync --delete over live data tree (deletes files missing at source)"),  # X233
+         "rsync --delete into live data tree or unknown destination (deletes destination files missing at source)"),  # X233
         ("rsync -a --delete /root/5ac/research/ /mnt/backup/research/",
-         "rsync --delete over live data tree (deletes files missing at source)"),  # X247
+         "rsync --delete into live data tree or unknown destination (deletes destination files missing at source)"),  # X247
         ("rsync -a --delete /mnt/backup/research/ /root/5ac/research/",
-         "rsync --delete over live data tree (deletes files missing at source)"),  # X251
+         "rsync --delete into live data tree or unknown destination (deletes destination files missing at source)"),  # X251
         ("crontab -r", "remove crontab (crontab -r)"),  # X261
         ("truncate -s 0 /root/5ac/research/agent-cost-verify-2026-09-18/metrics.json",
          "truncate file to zero (data destruction)"),  # X006
