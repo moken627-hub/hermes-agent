@@ -68,14 +68,6 @@ _TRANSIENT_OWNER_STATES = frozenset({'draining', 'starting'})
 # Past the board lock wait: the owner's session setup and receipt before and after the write.
 ADMISSION_ANSWER_MARGIN_S = 60.0
 
-# [5ac:owner-transport-retry] an owner alive but thrashing under the host's RAM ceiling fails the
-# websocket dial with one of these transport messages (upstream issue #139612 class of burn).
-_TRANSPORT_FAILURE_PREFIXES = ('Gateway connection failed', 'Gateway connection timed out')
-
-
-def _is_transport_failure(exc):  # [5ac:owner-transport-retry] host condition, not the card's
-    return str(exc).startswith(_TRANSPORT_FAILURE_PREFIXES)
-
 
 # [t_83195837:F1] the bounded wire codes the OWNER itself decides (gateway/session_kanban.
 # admit_claim and the runtime store raise them). ONLY these may be reported as an owner refusal;
@@ -125,8 +117,13 @@ def _transient_refusal_code(exc):  # [t_dd382f5c:R2-3] the drain class is decide
 def _retryable_failure(exc):  # [t_83195837:F4/F8] class gate only — the invariant is asserted apart
     """Whether ``exc`` is a class the submitter may redial AT ALL. The admission invariant is
     checked separately before every attempt, so a retryable class can never become a duplicate."""
-    if isinstance(exc, OSError) or _is_transport_failure(exc):
-        return True  # [5ac:owner-transport-retry] host transport: RAM-ceiling thrash, restart race
+    if isinstance(exc, OSError):
+        # [t_9f783364] 28/10: a refused/stalled dial is a bare OSError — the host's condition
+        # (RAM-ceiling thrash, restart race), unambiguous at dial time. The [5ac:owner-transport-retry]
+        # message-prefix classifier was retired with it: gateway_client wraps POST-DIAL failures into
+        # "Gateway connection failed" too (38/40 logged cases), and the F4 owner_admitted invariant
+        # plus F2's exit-76 classification now cover that class without a re-send risk.
+        return True
     return _transient_refusal_code(exc) is not None
 
 
