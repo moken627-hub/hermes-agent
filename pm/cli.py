@@ -524,11 +524,29 @@ def cmd_gc(args) -> int:
     facts = _facts() if store.root == _store().root else Facts(store.root / "facts.json")
     removed, kept = _gc_store(store, facts)
     from hermes_cli.runtime_state import collect_generations
-    from pm.environments import install_state_dir
+    from pm.environments import install_state_dir, owning_install_root
     from pm.paths import repo_root
     from pm.runtime import collect_runtime_generations
-    generations = collect_generations(repo_root())
-    runtimes = collect_runtime_generations(install_state_dir(repo_root()) / "pm-runtime")
+    # [5ac:pm-gc-owning-root] The install key must come from the owning checkout, not the
+    # executing tree: running from a generation's workspace hashes that workspace into a key
+    # nobody writes under, so the collectors reported a successful zero (upstream #125537).
+    project = owning_install_root(repo_root())
+    state = install_state_dir(project)
+    has_dependencies = (state / "environments").is_dir()
+    has_runtimes = (state / "pm-runtime").is_dir()
+    if not has_dependencies and not has_runtimes:
+        print(f"✗ no dependency generations at {state}: nothing to collect for {project}",
+              file=sys.stderr)
+        generations: list = []
+        runtimes: list = []
+        from pm.environments import installs_root
+        from pm.install_states import collect_orphan_install_states
+        orphans = collect_orphan_install_states(installs_root())
+        print(f"gc: removed {removed}, kept {kept}; removed 0 dependency generations, "
+              f"0 PM runtime generations, {len(orphans)} install state dir(s) of deleted checkouts")
+        return 1
+    generations = collect_generations(project) if has_dependencies else []
+    runtimes = collect_runtime_generations(state / "pm-runtime") if has_runtimes else []
     from pm.environments import installs_root
     from pm.install_states import collect_orphan_install_states
     orphans = collect_orphan_install_states(installs_root())
